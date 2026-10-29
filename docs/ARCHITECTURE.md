@@ -70,6 +70,10 @@ ScentState        { [종류][레이어] float[] Current / Next }     // 레이�
   3. 발생: `C ← C + e·dt·수량`
 - 고체 칸은 농도 0, 교환 없음. 맵 밖과도 교환 없음(밀폐). 감쇠·발생이 0이면 총량이 보존된다.
 - 안정성(비음수) 조건 `(4·D + Dp)·dt ≤ 1`을 틱·계수 변경 시 검증한다. 기본값 0.30. 반올림 오차 대비로 0 미만은 0으로 자른다.
+- 지원 범위(감사 F03/F06): 종류 ≤ `ScentSettings.MaxTypes`(256), 키·표시 이름 UTF-8 ≤ `MaxNameUtf8Bytes`(65,536바이트),
+  발생 계수 e ≤ `MaxEmission`(1e6), 농도 0 ~ `ScentState.MaxConcentration`(1e30). 설정은 `Validate()`가, 농도는 저장 전
+  `ExperimentSerializer.ValidateForSave`와 불러오기가 검사한다. 저장할 수 있는 설정·상태는 같은 구현으로 반드시 다시 불러올 수 있다.
+  D = Dp = 0이면 확산을 계산하지 않고 그대로 복사한다(큰 값에서 ∞−∞ = NaN 방지).
 - `ScentSystem`은 청크 `Version`이 바뀐 청크만 고체/수량 정보를 레이어 전체 배열 캐시로 다시 복사한다.
 
 ### 히트맵 (단일 / 복합)
@@ -99,6 +103,16 @@ ScentState        { [종류][레이어] float[] Current / Next }     // 레이�
 | 쓰기 | `MapEditor`(원자적 명령, Undo/Redo) | 계산 스레드의 세션만(현재는 냄새만 변함) |
 | 저장 | 맵 파일 `.antmap` (v1, 이전과 같음) | 실험 상태 파일 `.antexp` (설정·틱·시작 월드·현재 월드·냄새) |
 | 원본 반영 | — | 하지 않음. 편집 모드로 돌아가면 원본 그대로 |
+
+계산 스레드 명령 계약(`SimulationHost`, 감사 F02/F07/F05):
+- 상태는 Running → Stopping → Stopped, 또는 계산 스레드 예외 시 Faulted. Running이 아닐 때 들어온 명령은 큐에 넣지 않고
+  즉시 실패(Stopped: `ObjectDisposedException`, Faulted: 원인을 담은 `InvalidOperationException`).
+- 큐에 들어간 명령은 반드시 완료된다: 실행됨(결과/예외), 종료로 취소(`TaskCanceledException`), 또는 스레드 실패로 실패.
+- 명령이 예외로 끝나도 그때까지 바뀐 세션 상태는 그대로이며 호스트 틱과 다음 스냅샷이 그 상태를 따른다.
+- `ResetAsync`는 초기화된 월드 복제와 초기화 세대(`ResetCount`)를 돌려준다. 화면은 이 월드로 바꾸고, 세대가 낮은 스냅샷은 버린다.
+
+파일 로더 검증(감사 F01/E01): 크기 필드로 배열을 만들기 전에 실제 남은 바이트를 확인한다. 길이를 알 수 없는 스트림은 실제로 받은
+만큼만 점진적으로 버퍼링한다(받은 데이터의 약 2배 이내). 실험 파일의 내장 맵은 선언된 구간만 읽는 체크섬 스트림으로 읽는다.
 
 실행 중 임의 편집(실험 도구)은 아직 없다. 추가할 때는 `SimulationHost.RunExclusiveAsync`로 틱 사이에 세션을 바꾸는 방식이 된다.
 

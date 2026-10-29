@@ -141,3 +141,13 @@
 - 기존 테스트 중 규칙 변경으로 바뀐 것은 계획대로 2건(`PlaceSolid_OnTileWithQuantity_IsRejected` → `…_RemovesQuantities`, 가장자리 통로 스트로크)이다.
 - 자동 테스트 98 → 187개, Godot 스모크 테스트에 시뮬레이션 모드 시나리오 추가.
 - 구현 중 발견해 고친 결함: `SimulationHost.RunExclusiveAsync`로 진행한 틱이 공개 `Tick`에 반영되지 않던 문제.
+
+## PR #2 독립 감사 수정 (F01~F07, E01)
+
+- 결함마다 수정 전에 실패하는 재현 테스트를 먼저 작성했다(`tests/AntSim.Core.Tests/AuditRegressionTests.cs`, 기준 해시 `AuditGoldenTests.cs`).
+  큰 할당 테스트는 실제 큰 배열을 만들지 않고, 할당 전 거부와 스레드 할당량(`GC.GetAllocatedBytesForCurrentThread`)으로 확인한다.
+  동시성 테스트는 sleep 대신 `SimulationHost.TestHook` 동기화 지점을 쓴다.
+- 파일 형식(.antmap v1, .antexp v1)은 바꾸지 않았다. 공개 API 변경: `SimulationHost.ResetAsync()`가 `Task<SimulationResetResult>`를 반환,
+  `SimulationSession.ResetCount`, `SimulationSnapshot.ResetCount`, `ScentSettings.MaxTypes/MaxNameUtf8Bytes/MaxEmission`,
+  `ScentState.MaxConcentration/AllValuesInSupportedRange`, `ExperimentSerializer.ValidateForSave`, `MapSerializer.EncodedLength`.
+- 자동 테스트 212(감사 직전 PR #2 head cc5d416) → 267개(신규 55개).
