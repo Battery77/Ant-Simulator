@@ -5,7 +5,7 @@ namespace AntSim.Core.Worlds;
 /// <summary>
 /// 시뮬레이션 월드 데이터의 루트. 지상/개미집 두 레이어, 통로 집합, 규칙을 소유한다.
 /// Godot 타입에 의존하지 않으며, 렌더링은 이 데이터를 읽기만 한다.
-/// 새 월드의 모든 타일은 흙 지형, 블록 없음 상태다.
+/// 생성자는 빈 월드(모든 타일 흙, 블록 없음)를 만든다. 기본 개미집 프리셋은 <see cref="WorldPresets"/>.
 /// </summary>
 public sealed class World
 {
@@ -37,6 +37,18 @@ public sealed class World
     {
         if ((uint)id >= LayerCount) throw new ArgumentOutOfRangeException(nameof(id), id, "알 수 없는 레이어입니다.");
         return _layers[(int)id];
+    }
+
+    /// <summary>
+    /// 타일·통로·규칙이 같은 독립 복제본을 만든다(시뮬레이션 모드용). 이후 두 월드는 서로 영향을 주지 않는다.
+    /// 복제본의 청크는 더티가 아닌 상태로 시작한다.
+    /// </summary>
+    public World Clone()
+    {
+        var copy = new World(Config, Rules);
+        for (int i = 0; i < LayerCount; i++) copy._layers[i].CopyFrom(_layers[i]);
+        copy.Passages.CopyFrom(Passages);
+        return copy;
     }
 
     /// <summary>통로 유무를 설정한다. 바뀌면 두 레이어의 해당 청크를 더티로 표시한다.</summary>
