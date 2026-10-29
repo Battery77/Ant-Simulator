@@ -1,3 +1,4 @@
+using System.Numerics;
 using AntSim.Core.Worlds;
 
 namespace AntSim.Core.Scent;
@@ -8,7 +9,8 @@ namespace AntSim.Core.Scent;
 /// <item>확산: C'ᵢ = Cᵢ + D·dt·Σ(Cⱼ − Cᵢ), j는 맵 안의 비고체 4이웃. 고체 칸·맵 밖과는 교환하지 않는다(밀폐 경계).</item>
 /// <item>통로: 중심 좌표에서만, 두 레이어의 중심이 모두 비고체일 때 Dp·dt·(C반대 − C)를 교환한다.</item>
 /// <item>감쇠: C ← C·exp(−k·dt). 발생: C ← C + e·dt·수량.</item>
-/// <item>고체 칸의 농도는 항상 0이다.</item>
+/// <item>고체 칸의 농도는 항상 0이다. 반올림으로 0 미만이 된 값은 0으로, 지원 상한(<see cref="ScentState.MaxConcentration"/>)을
+/// 반올림 여유(<see cref="RoundingSlackUlps"/>) 안에서 넘은 값은 상한으로 되돌린다.</item>
 /// </list>
 /// 모든 계산은 Current만 읽고 Next에 쓴 뒤 교환하므로 순회 순서와 무관하며, 단일 스레드에서 항상 같은 결과를 낸다.
 /// 월드 타일 데이터는 청크 Version이 바뀐 청크만 레이어 전체 배열 캐시로 다시 복사한다.
@@ -123,15 +125,76 @@ public sealed class ScentSystem
         }
     }
 
-    private static void DecayAndEmit(float[] next, float decay, byte[]? source, float emit)
+    /// <summary>
+    /// 상한 보정 여유(ULP). 안정 조건 (4D+Dp)·dt ≤ 1을 만족하면 실수 연산에서는 확산·통로 교환 결과가 입력 최대값을 넘지 않지만,
+    /// float 계수 변환(5개 계수의 반올림, 각 0.5 ULP 이하)과 이웃 차이·곱·합의 반올림(칸당 10회 이하, 각 0.5 ULP 이하) 때문에
+    /// 상한 근처 값이 몇 ULP 넘을 수 있다(재검증 반례 +1 ULP, 보정 없이 CFL 경계 무작위 조합 약 19만 건 실측 최대 +1 ULP).
+    /// 이 반올림 오차보다 넉넉한 64 ULP(상대 약 7.6e-6)까지만 보정한다.
+    /// 감쇠 계수는 ≤ 1이고, 발생 증분(≤ 1e6 × 10초 × 255)은 상한 근처 float 간격(약 7.5e22)보다 훨씬 작아 상한을 넘기지 못한다.
+    /// </summary>
+    internal const int RoundingSlackUlps = 64;
+
+    private static readonly float RoundingCeiling =
+        BitConverter.Int32BitsToSingle(BitConverter.SingleToInt32Bits(ScentState.MaxConcentration) + RoundingSlackUlps);
+
+    /// <summary>
+    /// 지원 상한을 반올림 여유 안에서 넘은 값만 상한으로 되돌린다. 그보다 큰 값(지원 범위 밖 입력)은 그대로 두어
+    /// 저장 검사에서 거부되게 한다. 상한 이하 값은 바꾸지 않으므로 정상 농도의 계산 결과·상태 해시는 그대로다.
+    /// </summary>
+    internal static float CorrectRoundingOvershoot(float value) =>
+        value > ScentState.MaxConcentration && value <= RoundingCeiling ? ScentState.MaxConcentration : value;
+
+    /// <summary>0 미만(−0 포함) → +0, 상한을 반올림 여유 안에서 넘은 값 → 상한, 그 외(NaN 포함)는 그대로.</summary>
+    private static float ClampToSupported(float value) => CorrectRoundingOvershoot(MathF.Max(0f, value));
+
+    /// <summary><see cref="ClampToSupported(float)"/>의 벡터판. 원소마다 같은 비교·선택이라 결과 비트가 같다.</summary>
+    private static Vector<float> ClampToSupported(Vector<float> v)
     {
+        v = Vector.ConditionalSelect(Vector.LessThanOrEqual(v, Vector<float>.Zero), Vector<float>.Zero, v);
+        var max = new Vector<float>(ScentState.MaxConcentration);
+        var overshoot = Vector.GreaterThan(v, max) & Vector.LessThanOrEqual(v, new Vector<float>(RoundingCeiling));
+        return Vector.ConditionalSelect(overshoot, max, v);
+    }
+
+    /// <summary>
+    /// 감쇠·발생과 범위 정리: next ← clamp(next·decay [+ emit·수량]). 매 틱 모든 칸을 지나는 경로라 벡터로 계산하고 나머지는 스칼라로 처리한다.
+    /// 곱·합은 원소마다 같은 IEEE 단정도 연산(융합 없음)이므로 스칼라 계산과 비트 단위로 같다.
+    /// </summary>
+    internal static void DecayAndEmit(float[] next, float decay, byte[]? source, float emit)
+    {
+        int i = 0;
+        var vDecay = new Vector<float>(decay);
         if (source is null || emit == 0)
         {
-            for (int i = 0; i < next.Length; i++) next[i] = MathF.Max(0f, next[i] * decay);
+            if (Vector.IsHardwareAccelerated)
+                for (; i <= next.Length - Vector<float>.Count; i += Vector<float>.Count)
+                    ClampToSupported(new Vector<float>(next, i) * vDecay).CopyTo(next, i);
+            for (; i < next.Length; i++) next[i] = ClampToSupported(next[i] * decay);
             return;
         }
-        for (int i = 0; i < next.Length; i++)
-            next[i] = MathF.Max(0f, next[i] * decay + emit * source[i]);
+
+        if (Vector.IsHardwareAccelerated)
+        {
+            var vEmit = new Vector<float>(emit);
+            int floats = Vector<float>.Count;
+            for (; i <= next.Length - Vector<byte>.Count; i += Vector<byte>.Count)
+            {
+                Vector.Widen(new Vector<byte>(source, i), out var low, out var high);
+                Vector.Widen(low, out var q0, out var q1);
+                Vector.Widen(high, out var q2, out var q3);
+                Apply(i, q0);
+                Apply(i + floats, q1);
+                Apply(i + 2 * floats, q2);
+                Apply(i + 3 * floats, q3);
+            }
+
+            void Apply(int at, Vector<uint> quantity)
+            {
+                var q = Vector.ConvertToSingle(Vector.AsVectorInt32(quantity)); // 0~255라 정확히 변환
+                ClampToSupported(new Vector<float>(next, at) * vDecay + vEmit * q).CopyTo(next, at);
+            }
+        }
+        for (; i < next.Length; i++) next[i] = ClampToSupported(next[i] * decay + emit * source[i]);
     }
 
     /// <summary>바뀐 청크의 고체/수량 정보와 통로 목록을 레이어 전체 배열 캐시에 반영한다.</summary>
