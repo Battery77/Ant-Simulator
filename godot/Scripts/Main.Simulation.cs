@@ -1,4 +1,5 @@
 using AntSim.Core.Editing;
+using AntSim.Core.Rendering;
 using AntSim.Core.Scent;
 using AntSim.Core.Serialization;
 using AntSim.Core.Simulation;
@@ -23,7 +24,11 @@ public partial class Main
     private World? _simWorld;
     private ScentSnapshot? _snapshot;
     private ScentSettings _scentSettings = ScentSettings.Default;
-    private HeatmapOptions _heatmapOptions = new(0, AntSim.Core.Rendering.HeatmapScale.Linear, true, 10);
+    private HeatmapOptions _heatmapOptions = new(HeatmapMode.Single, 0, HeatmapScale.Linear, true, Array.Empty<float>());
+    private readonly CompositeHeatmapPalette _compositePalette = CompositeHeatmapPalette.CreateDefault();
+    private readonly CompositeHeatmapRasterizer _compositeRasterizer = new();
+    private CompositeChannel[] _channels = Array.Empty<CompositeChannel>();
+    private LegendEntry[] _legendEntries = Array.Empty<LegendEntry>();
     private double _speed = 1;
     private bool _heatmapDirty;
 
@@ -41,6 +46,7 @@ public partial class Main
             _speed = speed;
             if (_host is not null) _host.Speed = speed;
         };
+        _simPanel.SetLegendGradientProvider(LegendGradient);
         _simPanel.HeatmapChanged += options =>
         {
             _heatmapOptions = options;
@@ -138,7 +144,8 @@ public partial class Main
         double elapsed = _snapshot?.ElapsedSeconds ?? 0;
         _simPanel.SetClock(
             $"틱 {_host.Tick:N0} · {elapsed:0.0}초 · {(_host.IsPlaying ? "재생 중" : "일시정지")}\n" +
-            $"틱 간격 {SimulationPanel.FormatNumber(_scentSettings.TickSeconds)}초 · 틱 계산 {_host.LastTickMilliseconds:0.0}ms");
+            $"틱 간격 {SimulationPanel.FormatNumber(_scentSettings.TickSeconds)}초 · 틱 계산 {_host.LastTickMilliseconds:0.0}ms" +
+            (_heatmap.Visible ? $" · 히트맵 {_heatmap.LastRasterMilliseconds:0.0}ms" : ""));
 
         if (shown is not { } t)
         {
@@ -146,10 +153,14 @@ public partial class Main
             return;
         }
         string info = EditorText.DescribeTile(_simWorld, _view.Layer, t.X, t.Y);
-        if (_snapshot is { } s && s.Layer == _view.Layer && s.TypeIndex < _scentSettings.Types.Count)
+        if (_snapshot is { } s && s.Layer == _view.Layer)
         {
-            float value = s.Data[_simWorld.Config.ToLinearIndex(t.X, t.Y)];
-            info += $"\n냄새({_scentSettings.Types[s.TypeIndex].DisplayName}): {value:0.#####} (틱 {s.Tick})";
+            // 표시 색이 아니라 실제 농도 값을 보여 준다(복합 모드에서는 모든 냄새).
+            int index = _simWorld.Config.ToLinearIndex(t.X, t.Y);
+            foreach (int type in s.Types)
+                if (type < _scentSettings.Types.Count)
+                    info += $"\n냄새({_scentSettings.Types[type].DisplayName}): {s.Field(type)[index]:0.#####}";
+            if (s.Types.Count > 0) info += $" (틱 {s.Tick})";
         }
         _simPanel.SetInfo(info);
     }
@@ -157,22 +168,72 @@ public partial class Main
     private void UpdateHeatmap()
     {
         var options = _heatmapOptions;
-        if (_snapshot is not { } s || _simWorld is null || options.TypeIndex < 0 ||
-            s.TypeIndex != options.TypeIndex || s.Layer != _view.Layer)
+        var wanted = HeatmapTypes(options);
+        if (_snapshot is not { } s || _simWorld is null || wanted.Length == 0 || s.Layer != _view.Layer ||
+            !wanted.All(s.Contains))
         {
+            // 선택에 맞는 스냅샷이 아직 오지 않았으면 잘못된 색을 보이지 않도록 숨긴다.
             _heatmap.HideHeatmap();
-            _simPanel.SetMaxText(options.TypeIndex < 0 ? "히트맵 꺼짐" : "");
             return;
         }
-        float max = options.AutoMax ? s.Max : options.FixedMax;
-        _heatmap.ShowField(s.Data, _simWorld.Config.Width, _simWorld.Config.Height, max, options.Scale);
-        _simPanel.SetMaxText($"현재 최대 농도 {s.Max:0.####} · 표시 기준 {max:0.####} ({(options.Scale == AntSim.Core.Rendering.HeatmapScale.Log ? "로그" : "선형")})");
+
+        if (_legendEntries.Length != wanted.Length) _legendEntries = new LegendEntry[wanted.Length];
+        for (int i = 0; i < wanted.Length; i++)
+        {
+            int type = wanted[i];
+            float current = s.MaxOf(type);
+            _legendEntries[i] = new LegendEntry(type, current, options.AutoMax ? current : options.FixedMaxOf(type));
+        }
+        _simPanel.SetLegendValues(_legendEntries);
+
+        var config = _simWorld.Config;
+        if (options.Mode == HeatmapMode.Single)
+        {
+            var entry = _legendEntries[0];
+            _heatmap.ShowField(s.Field(entry.TypeIndex), config.Width, config.Height, entry.ShownMax, options.Scale);
+            return;
+        }
+
+        if (_channels.Length != wanted.Length) _channels = new CompositeChannel[wanted.Length];
+        for (int i = 0; i < wanted.Length; i++)
+        {
+            int type = wanted[i];
+            _channels[i] = new CompositeChannel(s.Field(type), _legendEntries[i].ShownMax, options.Scale,
+                _compositePalette.Get(_scentSettings.Types[type].Key));
+        }
+        _heatmap.ShowComposite(_channels, config.Width, config.Height, _compositeRasterizer);
     }
+
+    /// <summary>히트맵 모드가 필요로 하는 냄새 종류(숨김이면 빈 배열 → 계산 스레드가 필드를 복사하지 않음).</summary>
+    private int[] HeatmapTypes(HeatmapOptions options) => options.Mode switch
+    {
+        HeatmapMode.Single when options.TypeIndex >= 0 && options.TypeIndex < _scentSettings.Types.Count => new[] { options.TypeIndex },
+        HeatmapMode.Composite => Enumerable.Range(0, _scentSettings.Types.Count).ToArray(),
+        _ => Array.Empty<int>(),
+    };
 
     private void SelectHeatmapOnHost()
     {
         _heatmapDirty = true;
-        _host?.SelectHeatmap(Math.Max(0, _heatmapOptions.TypeIndex), _view.Layer);
+        _host?.SelectHeatmap(HeatmapTypes(_heatmapOptions), _view.Layer);
+    }
+
+    /// <summary>범례 색 막대. type = -1이면 단일 히트맵 색(기존 LUT), 아니면 복합 채널 색 램프.</summary>
+    private Gradient LegendGradient(int type)
+    {
+        var gradient = new Gradient();
+        var offsets = new List<float>();
+        var colors = new List<Color>();
+        for (int i = 0; i <= 4; i++)
+        {
+            int q = Math.Max(1, i * 255 / 4);
+            uint c = type < 0 ? HeatmapRasterizer.LutColor(q / 255f) : _compositePalette.Get(_scentSettings.Types[type].Key).ColorAt(q);
+            offsets.Add(i / 4f);
+            colors.Add(new Color((byte)c / 255f, (byte)(c >> 8) / 255f, (byte)(c >> 16) / 255f, Math.Max(0.35f, (byte)(c >> 24) / 255f)));
+        }
+        gradient.Offsets = offsets.ToArray();
+        gradient.Colors = colors.ToArray();
+        return gradient;
     }
 
     private void OnSimulationLayerChanged()

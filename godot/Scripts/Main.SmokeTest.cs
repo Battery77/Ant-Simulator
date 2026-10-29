@@ -1,4 +1,5 @@
 using AntSim.Core.Editing;
+using AntSim.Core.Rendering;
 using AntSim.Core.Serialization;
 using AntSim.Core.Worlds;
 using Godot;
@@ -132,6 +133,7 @@ public partial class Main
         check(_world.ComputeContentHash() == editorWorld, "시뮬레이션이 원본 맵을 바꾸지 않음");
 
         if (ScreenshotPath is { } screenshot && HasDisplay) await CaptureSimulationScreenshot(screenshot);
+        await SmokeCompositeHeatmap(check);
 
         string path = ProjectSettings.GlobalizePath("user://smoke-test.antexp");
         await SaveExperiment(path);
@@ -156,6 +158,54 @@ public partial class Main
         SetMode(AppMode.Edit);
         check(_mode == AppMode.Edit && _host is null && _panel.Visible && !_heatmap.Visible, "편집 모드 복귀");
         check(_world.ComputeContentHash() == editorWorld, "편집 모드 복귀 후 원본 그대로");
+    }
+
+    /// <summary>복합 히트맵: 단일 ↔ 복합 ↔ 숨김 전환, 레이어 전환, 전환해도 시뮬레이션 상태 불변.</summary>
+    private async Task SmokeCompositeHeatmap(Action<bool, string> check)
+    {
+        var host = _host!;
+        var (tickBefore, hashBefore) = await host.RunExclusiveAsync(s => (s.Tick, s.ComputeStateHash()));
+
+        _simPanel.SelectHeatmap(HeatmapMode.Composite);
+        check(_heatmapOptions.Mode == HeatmapMode.Composite, "복합 모드 선택");
+        await WaitUntil(() => _snapshot is { } s && s.Types.Count == 2 && s.Layer == LayerId.Surface, "복합 스냅샷(음식+유충)");
+        await NextFrame();
+        check(_heatmap.Visible, "복합 히트맵 표시");
+        check(_simPanel.LegendRowCount == 2, $"범례 2줄 (실제 {_simPanel.LegendRowCount})");
+
+        SetLayer(LayerId.Nest);
+        await WaitUntil(() => _snapshot is { } s && s.Types.Count == 2 && s.Layer == LayerId.Nest, "개미집 복합 스냅샷");
+        await NextFrame();
+        check(_heatmap.Visible, "개미집 레이어 복합 히트맵");
+        check(_snapshot!.MaxOf(1) > 0, "개미집 유충 냄새 존재");
+        SetLayer(LayerId.Surface);
+
+        _simPanel.SelectHeatmap(HeatmapMode.Hidden);
+        await WaitUntil(() => _snapshot is { } s && s.Types.Count == 0, "숨김 스냅샷(필드 없음)");
+        await NextFrame();
+        check(!_heatmap.Visible, "히트맵 숨김");
+
+        _simPanel.SelectHeatmap(HeatmapMode.Single, 1);
+        await WaitUntil(() => _snapshot is { } s && s.Types.Count == 1 && s.TypeIndex == 1, "유충 단일 스냅샷");
+        await NextFrame();
+        check(_heatmap.Visible && _simPanel.LegendRowCount == 1, "단일(유충) 히트맵 복귀");
+
+        var (tickAfter, hashAfter) = await host.RunExclusiveAsync(s => (s.Tick, s.ComputeStateHash()));
+        check(tickAfter == tickBefore && hashAfter == hashBefore, "히트맵 모드 전환 후 시뮬레이션 상태 불변");
+
+        if (ScreenshotPath is { } screenshot && HasDisplay) await CaptureCompositeScreenshot(screenshot);
+        _simPanel.SelectHeatmap(HeatmapMode.Single, 0);
+    }
+
+    private async Task CaptureCompositeScreenshot(string path)
+    {
+        _simPanel.SelectHeatmap(HeatmapMode.Composite);
+        _camera.FitTo(new Rect2(10, 55, 48, 30));
+        _camera.Position -= new Vector2(6, 0);
+        await WaitUntil(() => _snapshot is { } s && s.Types.Count == 2 && s.Layer == LayerId.Surface, "스크린샷용 복합 스냅샷");
+        _pinnedTile = new Vector2I(30, 72); // 먹이 줄(y=70)과 유충 줄(y=74) 사이: 두 냄새가 겹침
+        await SaveScreenshot(path.Replace(".png", "-composite.png"));
+        _pinnedTile = null;
     }
 
     /// <summary>실제 입력 이벤트(왼쪽 버튼 누름 → 이동 → 해제)로 드래그 편집 경로를 점검한다. 디스플레이가 있을 때만.</summary>
@@ -231,13 +281,13 @@ public partial class Main
         });
         _camera.FitTo(new Rect2(0, 0, 110, 85));
         _camera.Position -= new Vector2(10, 0);
-        _heatmapOptions = _heatmapOptions with { Scale = AntSim.Core.Rendering.HeatmapScale.Log };
+        _heatmapOptions = _heatmapOptions with { Scale = HeatmapScale.Log };
         SelectHeatmapOnHost();
         await WaitUntil(() => _snapshot is { Tick: > 600 }, "스크린샷용 스냅샷");
         _pinnedTile = new Vector2I(40, 40);
         await SaveScreenshot(path.Replace(".png", "-sim.png"));
         _pinnedTile = null;
-        _heatmapOptions = _heatmapOptions with { Scale = AntSim.Core.Rendering.HeatmapScale.Linear };
+        _heatmapOptions = _heatmapOptions with { Scale = HeatmapScale.Linear };
         SelectHeatmapOnHost();
     }
 

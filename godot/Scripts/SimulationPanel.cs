@@ -5,8 +5,23 @@ using Godot;
 
 namespace AntSim.App;
 
-/// <summary>히트맵 표시 선택. TypeIndex가 -1이면 히트맵을 끈다.</summary>
-public readonly record struct HeatmapOptions(int TypeIndex, HeatmapScale Scale, bool AutoMax, float FixedMax);
+public enum HeatmapMode
+{
+    Hidden,
+    /// <summary>냄새 한 종류(기존 단일 히트맵).</summary>
+    Single,
+    /// <summary>모든 냄새 종류를 색으로 합성(종류별 독립 정규화).</summary>
+    Composite,
+}
+
+/// <summary>히트맵 표시 선택. 고정 최대값은 냄새 종류별로 따로 둔다.</summary>
+public sealed record HeatmapOptions(HeatmapMode Mode, int TypeIndex, HeatmapScale Scale, bool AutoMax, IReadOnlyList<float> FixedMax)
+{
+    public float FixedMaxOf(int type) => type < FixedMax.Count ? FixedMax[type] : 10f;
+}
+
+/// <summary>범례 한 줄에 표시할 값: 종류, 현재 최대 농도, 실제 표시 기준 최대값.</summary>
+public readonly record struct LegendEntry(int TypeIndex, float CurrentMax, float ShownMax);
 
 /// <summary>시뮬레이션 모드 왼쪽 패널: 실행 제어, 히트맵, 냄새 설정, 실험 저장/불러오기, 타일 정보.</summary>
 public partial class SimulationPanel : PanelContainer
@@ -18,8 +33,11 @@ public partial class SimulationPanel : PanelContainer
     private OptionButton _heatType = null!;
     private OptionButton _heatScale = null!;
     private CheckBox _autoMax = null!;
-    private SpinBox _fixedMax = null!;
+    private VBoxContainer _legend = null!;
+    private readonly List<(int Type, Label Text, SpinBox Fixed)> _legendRows = new();
+    private float[] _fixedMax = Array.Empty<float>();
     private Label _maxLabel = null!;
+    private Func<int, Gradient>? _legendGradient;
     private SpinBox _tick = null!;
     private OptionButton _settingsType = null!;
     private SpinBox _diffusion = null!;
@@ -42,11 +60,20 @@ public partial class SimulationPanel : PanelContainer
     public event Action? SaveExperimentRequested;
     public event Action? LoadExperimentRequested;
 
-    public HeatmapOptions Heatmap => new(
-        _heatType.Selected - 1,
-        _heatScale.Selected == 1 ? HeatmapScale.Log : HeatmapScale.Linear,
-        _autoMax.ButtonPressed,
-        (float)_fixedMax.Value);
+    public HeatmapOptions Heatmap
+    {
+        get
+        {
+            int selected = _heatType.Selected, types = _pending.Types.Count;
+            var mode = selected <= 0 ? HeatmapMode.Hidden : selected <= types ? HeatmapMode.Single : HeatmapMode.Composite;
+            return new HeatmapOptions(mode, mode == HeatmapMode.Single ? selected - 1 : -1,
+                _heatScale.Selected == 1 ? HeatmapScale.Log : HeatmapScale.Linear,
+                _autoMax.ButtonPressed, (float[])_fixedMax.Clone());
+        }
+    }
+
+    /// <summary>범례 색 막대(종류 → 그라디언트). 단일 모드는 type = -1로 호출된다.</summary>
+    public void SetLegendGradientProvider(Func<int, Gradient> provider) => _legendGradient = provider;
 
     public override void _Ready()
     {
@@ -76,21 +103,22 @@ public partial class SimulationPanel : PanelContainer
 
         root.AddChild(Header("히트맵"));
         _heatType = Options("끄기");
-        _heatType.ItemSelected += _ => HeatmapChanged?.Invoke(Heatmap);
+        _heatType.ItemSelected += _ => OnHeatmapOptionsChanged();
         root.AddChild(_heatType);
         _heatScale = Options("선형", "로그");
-        _heatScale.ItemSelected += _ => HeatmapChanged?.Invoke(Heatmap);
+        _heatScale.ItemSelected += _ => OnHeatmapOptionsChanged();
         root.AddChild(_heatScale);
-        var maxRow = new HBoxContainer();
-        _autoMax = new CheckBox { Text = "자동 최대값", ButtonPressed = true, FocusMode = FocusModeEnum.None };
-        _autoMax.Toggled += _ => HeatmapChanged?.Invoke(Heatmap);
-        _fixedMax = Number(0.001, 1_000_000, 0.001, 10);
-        _fixedMax.ValueChanged += _ => HeatmapChanged?.Invoke(Heatmap);
-        maxRow.AddChild(_autoMax);
-        maxRow.AddChild(_fixedMax);
-        root.AddChild(maxRow);
-        _maxLabel = new Label();
+        _autoMax = new CheckBox { Text = "자동 최대값 (냄새 종류별)", ButtonPressed = true, FocusMode = FocusModeEnum.None };
+        _autoMax.Toggled += _ => OnHeatmapOptionsChanged();
+        root.AddChild(_autoMax);
+        _legend = new VBoxContainer();
+        root.AddChild(_legend);
+        _maxLabel = new Label { AutowrapMode = TextServer.AutowrapMode.WordSmart, Modulate = new Color(1, 1, 1, 0.7f) };
         root.AddChild(_maxLabel);
+
+        root.AddChild(Header("타일 정보 (클릭: 고정, Esc: 해제)"));
+        _info = new Label { AutowrapMode = TextServer.AutowrapMode.WordSmart };
+        root.AddChild(_info);
 
         root.AddChild(Header("냄새 설정"));
         _tick = AddNumberRow(root, "틱 간격(초)", 0.001, ScentSettings.MaxTickSeconds, 0.001);
@@ -116,9 +144,6 @@ public partial class SimulationPanel : PanelContainer
         file.AddChild(ActionButton("실험 저장", () => SaveExperimentRequested?.Invoke()));
         file.AddChild(ActionButton("실험 불러오기", () => LoadExperimentRequested?.Invoke()));
 
-        root.AddChild(Header("타일 정보"));
-        _info = new Label { AutowrapMode = TextServer.AutowrapMode.WordSmart };
-        root.AddChild(_info);
         root.AddChild(Header("상태"));
         _status = new Label { AutowrapMode = TextServer.AutowrapMode.WordSmart };
         root.AddChild(_status);
@@ -140,7 +165,15 @@ public partial class SimulationPanel : PanelContainer
         _heatType.Clear();
         _heatType.AddItem("끄기");
         foreach (var type in settings.Types) _heatType.AddItem($"냄새: {type.DisplayName}");
-        _heatType.Selected = Math.Min(heatSelected == 0 && settings.Types.Count > 0 ? 1 : heatSelected, settings.Types.Count);
+        if (settings.Types.Count > 1) _heatType.AddItem($"복합: {string.Join(" + ", settings.Types.Select(t => t.DisplayName))}");
+        _heatType.Selected = Math.Min(heatSelected == 0 && settings.Types.Count > 0 ? 1 : heatSelected, _heatType.ItemCount - 1);
+        if (_fixedMax.Length != settings.Types.Count)
+        {
+            var resized = new float[settings.Types.Count];
+            for (int i = 0; i < resized.Length; i++) resized[i] = i < _fixedMax.Length ? _fixedMax[i] : 10f;
+            _fixedMax = resized;
+        }
+        RebuildLegend();
 
         int typeSelected = Math.Clamp(_settingsType.Selected, 0, settings.Types.Count - 1);
         _settingsType.Clear();
@@ -151,11 +184,92 @@ public partial class SimulationPanel : PanelContainer
         ShowPendingType();
     }
 
+    /// <summary>히트맵 선택(끄기/단일/복합)을 고른다. 테스트·단축 조작용.</summary>
+    public void SelectHeatmap(HeatmapMode mode, int typeIndex = 0)
+    {
+        _heatType.Selected = mode switch
+        {
+            HeatmapMode.Hidden => 0,
+            HeatmapMode.Single => typeIndex + 1,
+            _ => Math.Min(_pending.Types.Count + 1, _heatType.ItemCount - 1),
+        };
+        OnHeatmapOptionsChanged();
+    }
+
+    /// <summary>범례의 냄새별 현재 최대 농도와 표시 기준값을 갱신한다.</summary>
+    public void SetLegendValues(ReadOnlySpan<LegendEntry> entries)
+    {
+        foreach (var entry in entries)
+        foreach (var row in _legendRows)
+        {
+            if (row.Type != entry.TypeIndex) continue;
+            string name = _pending.Types[entry.TypeIndex].DisplayName;
+            row.Text.Text = $"{name} · 표시 최대 {entry.ShownMax:0.####} {(_autoMax.ButtonPressed ? "(자동)" : "(고정)")}\n현재 최대 {entry.CurrentMax:0.####}";
+        }
+    }
+
     public void SetClock(string text) => _clock.Text = text;
-    public void SetMaxText(string text) => _maxLabel.Text = text;
+    public int LegendRowCount => _legendRows.Count;
+
     public void SetSettingsMessage(string text) => _settingsMessage.Text = text;
     public void SetInfo(string text) => _info.Text = text;
     public void SetStatus(string text) => _status.Text = text;
+
+    private void OnHeatmapOptionsChanged()
+    {
+        RebuildLegend();
+        HeatmapChanged?.Invoke(Heatmap);
+    }
+
+    /// <summary>표시 중인 냄새 종류마다 색 막대, 표시 최대값, 고정 최대값 입력을 한 줄씩 만든다.</summary>
+    private void RebuildLegend()
+    {
+        if (_legend is null) return;
+        foreach (var child in _legend.GetChildren()) child.QueueFree();
+        _legendRows.Clear();
+
+        var options = Heatmap;
+        IEnumerable<int> types = options.Mode switch
+        {
+            HeatmapMode.Single => new[] { options.TypeIndex },
+            HeatmapMode.Composite => Enumerable.Range(0, _pending.Types.Count),
+            _ => Array.Empty<int>(),
+        };
+        foreach (int type in types)
+        {
+            var row = new HBoxContainer();
+            var gradient = _legendGradient?.Invoke(options.Mode == HeatmapMode.Composite ? type : -1);
+            if (gradient is not null)
+            {
+                row.AddChild(new TextureRect
+                {
+                    Texture = new GradientTexture1D { Gradient = gradient, Width = 64 },
+                    ExpandMode = TextureRect.ExpandModeEnum.IgnoreSize,
+                    StretchMode = TextureRect.StretchModeEnum.Scale,
+                    CustomMinimumSize = new Vector2(36, 28),
+                });
+            }
+            var text = new Label { Text = _pending.Types[type].DisplayName, SizeFlagsHorizontal = SizeFlags.ExpandFill };
+            row.AddChild(text);
+            var fixedMax = Number(0.0001, 1_000_000, 0.0001, _fixedMax[type]);
+            fixedMax.CustomMinimumSize = new Vector2(90, 0);
+            fixedMax.Editable = !_autoMax.ButtonPressed;
+            fixedMax.TooltipText = "고정 최대값 (자동 최대값을 끄면 사용)";
+            int captured = type;
+            fixedMax.ValueChanged += v =>
+            {
+                _fixedMax[captured] = (float)v;
+                HeatmapChanged?.Invoke(Heatmap);
+            };
+            row.AddChild(fixedMax);
+            _legend.AddChild(row);
+            _legendRows.Add((type, text, fixedMax));
+        }
+
+        _maxLabel.Text = options.Mode == HeatmapMode.Composite
+            ? "복합 모드: 냄새마다 따로 정규화합니다. 색의 진하기는 같은 냄새 안에서만 비교하고, 냄새 간 실제 농도는 위의 표시 최대값으로 비교하세요."
+            : options.Mode == HeatmapMode.Hidden ? "히트맵 꺼짐" : "";
+    }
 
     private void ShowPendingType()
     {

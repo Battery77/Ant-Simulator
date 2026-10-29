@@ -122,6 +122,20 @@ Console.WriteLine($"  0.1초 틱 실시간 재생 시 계산 부하: {tickMs / 1
 var field = scentSession.Scent.Field(0, LayerId.Surface).ToArray();
 var heat = new byte[config.TileCount * 4];
 Measure("Heatmap 래스터 (레이어 1장, 선형)", () => HeatmapRasterizer.Rasterize(field, HeatmapRasterizer.ComputeMax(field), HeatmapScale.Linear, heat), config.TileCount);
+var larvaField = scentSession.Scent.Field(1, LayerId.Surface).ToArray();
+for (int i = 0; i < larvaField.Length; i += 7) larvaField[i] += 0.5f; // 겹침이 많은 경우
+var compositePalette = CompositeHeatmapPalette.CreateDefault();
+var composite = new CompositeHeatmapRasterizer();
+var channels = new[]
+{
+    new CompositeChannel(field, HeatmapRasterizer.ComputeMax(field), HeatmapScale.Linear, compositePalette.Get("food")),
+    new CompositeChannel(larvaField, HeatmapRasterizer.ComputeMax(larvaField), HeatmapScale.Linear, compositePalette.Get("larva")),
+};
+Measure("Composite 래스터 (2종, 선형)", () => composite.Rasterize(channels, heat), config.TileCount);
+var logChannels = channels.Select(c => c with { Scale = HeatmapScale.Log }).ToArray();
+Measure("Composite 래스터 (2종, 로그)", () => composite.Rasterize(logChannels, heat), config.TileCount);
+Measure("Heatmap 래스터 (레이어 1장, 로그)", () => HeatmapRasterizer.Rasterize(field, HeatmapRasterizer.ComputeMax(field), HeatmapScale.Log, heat), config.TileCount);
+
 Measure("World.Clone (시뮬레이션 시작)", () => sink += scentWorld.Clone().Passages.Count, config.TileCount * 2L);
 var expStream = new MemoryStream();
 Measure("ExperimentSerializer.Save", () =>
