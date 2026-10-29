@@ -1,6 +1,6 @@
 # 아키텍처
 
-> Phase 1(월드 데이터 구조 + 맵 편집기) 구현 완료 기준. 냄새·시뮬레이션 스레드는 설계안이다.
+> 월드 데이터, 맵 편집기, 냄새 시스템, 편집/시뮬레이션 모드 분리까지 구현된 기준. 개미·여왕개미는 아직 없다.
 > 작업 계획·테스트·성능 측정 계획은 [`PLAN.md`](PLAN.md), 미정 규칙은 [`OPEN_QUESTIONS.md`](OPEN_QUESTIONS.md).
 
 ## 1. 프로젝트 구조
@@ -14,11 +14,15 @@ src/AntSim.Core/                 # 순수 C# 시뮬레이션 코어 (net8.0, God
   Serialization/ MapSerializer(버전 있는 바이너리 형식), MapFormatException
   Rendering/     ChunkRasterizer, TilePalette (청크 → RGBA 픽셀, Godot 비의존)
   Util/          Fnv1a64(결정적 해시), GridLine(브레젠험)
-  Scent/         [Phase 2] ScentRegistry, ScentField, ScentSystem
-  Simulation/    [Phase 3] SimulationHost(계산 스레드), 명령 큐, 고정 틱
+  Worlds/        + WorldPresets(Empty, StandardNest), World.Clone
+  Scent/         ScentSettings(검증), ScentState(종류×레이어 float 이중 버퍼), ScentSystem
+  Simulation/    SimulationSession(복제 월드 실험), SimulationHost(계산 스레드)
+  Serialization/ + ExperimentSerializer(.antexp), ChecksumStreams
+  Rendering/     + HeatmapRasterizer
 godot/                           # Godot 4 .NET 프로젝트 (렌더링·입력·UI만)
   project.godot, Main.tscn, AntSim.App.csproj, AntSim.App.sln
-  Scripts/ Main(조립 루트·입력), MapView(청크 텍스처), EditorCamera, EditorPanel, Main.SmokeTest
+  Scripts/ Main(조립 루트·입력), Main.Simulation(시뮬레이션 모드), MapView(청크 텍스처),
+           HeatmapView, EditorCamera, EditorPanel, SimulationPanel, ModeBar, Main.SmokeTest
 tests/AntSim.Core.Tests/         # xUnit, Godot 없이 실행
 tools/AntSim.Benchmarks/         # 기준 성능 측정
 tools/godot-smoke-test.sh        # Godot 통합 점검 (헤드리스 / xvfb)
@@ -51,20 +55,33 @@ tools/godot-smoke-test.sh        # Godot 통합 점검 (헤드리스 / xvfb)
 - 좌표당 1비트 비트셋(1024² 기준 128KB). 조회 O(1), 순회는 선형 인덱스 오름차순(결정적).
 - 통로가 바뀌면 두 레이어의 해당 청크를 더티로 표시한다(렌더링 갱신).
 
-### 냄새 (Phase 2 설계)
+### 냄새
 
 ```
-ScentDefinition { Key, SourcePlane(Food|Larva), EmissionPerUnit, DecayRate, Diffusion, PassageDiffusion }
-ScentField (냄새 종류 × 레이어) { float[] Current, float[] Next }   // 레이어 전체 연속 배열(W*H)
-ScentSettings { TickSeconds = 0.1, 종류별 계수 … }                    // 실행 중 변경 가능, 검증 후 적용
+ScentTypeSettings { Key, DisplayName, Source(Food|Larva|없음), Diffusion D, PassageDiffusion Dp, Decay k, Emission e }
+ScentSettings     { TickSeconds (기본 0.1), Types[] }           // 불변, Validate() 통과해야 적용
+ScentState        { [종류][레이어] float[] Current / Next }     // 레이어 전체 연속 배열(W*H)
 ```
 
-- 냄새 종류 추가 = `ScentDefinition` 등록 하나(필드·시스템 코드 변경 없음).
-- 틱 순서: **확산 → 감쇠 → 발생**. 확산은 Current만 읽고 Next에 쓴 뒤 교환(이중 버퍼).
-- 고체 칸은 농도 0이며 이웃과 플럭스를 교환하지 않는다. 맵 경계 밖 이웃도 플럭스 0(밀폐 경계 → 감쇠·발생이 없으면 총량 보존).
-- 레이어 간 이동은 통로 좌표에서만 일어난다.
-- 냄새 배열은 청크와 무관한 레이어 전체 배열이므로 청크 경계에서도 같은 공식이 적용된다(연속성).
-- 비음수 보장 조건: `(4·D + Dp)·dt ≤ 1`, `k·dt ≤ 1`. 설정 적용 시 검증한다. 초기값(0.6, 0.6, 0.025, dt 0.1)은 이웃당 교환율 해석 기준 0.30, 0.0025로 만족한다(해석은 Q1 확인 필요).
+- 냄새 종류 추가 = `ScentTypeSettings` 하나 추가(코드 변경 없음). `Source`가 없으면 타일에서 발생하지 않는다(이후 개미 페로몬용).
+- 틱 순서 고정: **확산 → 감쇠 → 발생**.
+  1. 확산(이웃당 교환율): `C'ᵢ = Cᵢ + D·dt·Σ(Cⱼ − Cᵢ)` (j = 맵 안의 비고체 4이웃) + 통로 중심이면 `Dp·dt·(C반대 − Cᵢ)` (양쪽 중심 모두 비고체일 때만)
+  2. 감쇠: `C ← C·exp(−k·dt)`
+  3. 발생: `C ← C + e·dt·수량`
+- 고체 칸은 농도 0, 교환 없음. 맵 밖과도 교환 없음(밀폐). 감쇠·발생이 0이면 총량이 보존된다.
+- 안정성(비음수) 조건 `(4·D + Dp)·dt ≤ 1`을 틱·계수 변경 시 검증한다. 기본값 0.30. 반올림 오차 대비로 0 미만은 0으로 자른다.
+- `ScentSystem`은 청크 `Version`이 바뀐 청크만 고체/수량 정보를 레이어 전체 배열 캐시로 다시 복사한다.
+
+### 편집 / 시뮬레이션 모드
+
+| | 편집 모드 | 시뮬레이션 모드 |
+|---|---|---|
+| 월드 | 원본(`Main._world`) | 시작 시 복제(`SimulationSession`) |
+| 쓰기 | `MapEditor`(원자적 명령, Undo/Redo) | 계산 스레드의 세션만(현재는 냄새만 변함) |
+| 저장 | 맵 파일 `.antmap` (v1, 이전과 같음) | 실험 상태 파일 `.antexp` (설정·틱·시작 월드·현재 월드·냄새) |
+| 원본 반영 | — | 하지 않음. 편집 모드로 돌아가면 원본 그대로 |
+
+실행 중 임의 편집(실험 도구)은 아직 없다. 추가할 때는 `SimulationHost.RunExclusiveAsync`로 틱 사이에 세션을 바꾸는 방식이 된다.
 
 ## 3. 주요 클래스
 
@@ -74,7 +91,13 @@ ScentSettings { TickSeconds = 0.1, 종류별 계수 … }                    // 
 | `World` | 레이어 2개 + `PassageMap` + `WorldRules`, 콘텐츠 해시 |
 | `WorldLayer` | 청크 격자, 타일 조회/검증된 쓰기, 더티 청크 수집, 행 복사 |
 | `Chunk` | 평면별 배열, `Version`/`IsDirty` |
-| `MapEditor` | 편집의 단일 진입점. 연산 배치를 임시 상태에 적용해 전부 검증한 뒤 일괄 반영(원자성), Undo/Redo, 스트로크 묶음 |
+| `MapEditor` | 편집의 단일 진입점. 연산 배치를 임시 상태에 적용해 전부 검증한 뒤 일괄 반영(원자성), Undo/Redo(256단계 + 메모리 상한 64MiB 추정), 스트로크 묶음. 고체 배치(수량 제거·물→흙)와 통로 생성(지상 검사·물→흙·개미집 3×3 굴착)도 각각 하나의 원자적 명령 |
+| `WorldPresets` | `Empty`(빈 월드), `StandardNest`(개미집 전부 토양, 새 맵 기본값) |
+| `ScentSystem` | 냄새 한 틱(확산 → 감쇠 → 발생) |
+| `SimulationSession` | 복제 월드 + 냄새 상태 + 틱. 단일 틱, 초기화, 설정 변경, 상태 해시 |
+| `SimulationHost` | 계산 스레드. 재생/일시정지/단일 틱/초기화/설정/임의 작업 명령, 히트맵 스냅샷 게시 |
+| `ExperimentSerializer` | 실험 상태 파일 저장/불러오기 |
+| `HeatmapRasterizer` | 농도 → RGBA(선형/로그, 자동/고정 최대값, 256단계 색 조회표) |
 | `EditOp` | 데이터로만 된 편집 명령(이후 계산 스레드 명령 큐로 그대로 전달 가능) |
 | `EditorStroke` | 클릭·드래그 경로 보간, 스트로크 내 타일당 1회 적용, 실패 집계 |
 | `MapSerializer` | 버전 있는 바이너리 형식 저장/불러오기, 손상·규칙 위반 거부 |
@@ -85,24 +108,29 @@ ScentSettings { TickSeconds = 0.1, 종류별 계수 … }                    // 
 ## 4. 데이터 흐름
 
 ```
-Phase 1 (현재: 편집만, 단일 스레드)
-  입력 이벤트 ─▶ Main ─EditorStroke/EditOp─▶ MapEditor ─검증·적용─▶ World
-                                                                   │ 더티 청크
-  MapView._Process ◀────────────── CollectDirtyChunks ◀───────────┘ → ChunkRasterizer → ImageTexture.Update
+편집 모드 (메인 스레드)
+  입력 → Main → EditorStroke/EditOp → MapEditor(검증·적용·Undo) → World(원본)
+  MapView._Process ← CollectDirtyChunks → ChunkRasterizer → 청크 ImageTexture.Update
 
-Phase 3 (계획: 시뮬레이션 스레드 분리)
-  Godot 메인 스레드                         계산 스레드 (SimulationHost)
-  입력 → EditOp ──(명령 큐)──────────────▶  틱 경계에서 MapEditor.Apply
-  재생/정지/단일 틱 ──(제어 큐)──────────▶  고정 dt 0.1s 틱: 확산 → 감쇠 → 발생
-  히트맵 텍스처 ◀──(완료된 스냅샷 교환)───  틱 후 표시용 버퍼 게시
+시뮬레이션 모드
+  시작:  World(원본).Clone() → SimulationSession ─넘김─▶ SimulationHost(계산 스레드)
+         세션.World.Clone() → 표시용 복제본(메인 스레드 전용, MapView가 그림)
+  메인 스레드                                 계산 스레드
+  재생/일시정지/단일 틱/초기화 ──명령──▶      고정 dt 틱: 확산 → 감쇠 → 발생
+  설정 적용 ──명령(검증)──▶                  다음 틱부터 적용
+  실험 저장 ──RunExclusive──▶                틱 사이에 직렬화
+  히트맵 종류·레이어 선택 ──▶                틱 후 선택 필드를 스냅샷(풀 재사용)으로 게시
+  HeatmapView ◀── TryTakeSnapshot ─────────  (메인 스레드는 세션을 직접 읽지 않음)
 ```
 
-- Phase 3부터 월드와 냄새 필드는 계산 스레드만 쓴다. 메인 스레드는 명령을 넣고, 게시된 스냅샷만 읽는다.
-- 편집 명령이 데이터(`EditOp`)라 큐로 넘기기 쉽고, "틱 N에 명령 X" 기록으로 실험을 재생할 수 있다.
+- 재생 속도는 "실제 시간당 몇 틱을 돌릴지"에만 영향을 준다. 결과는 틱 수에만 의존한다(테스트로 검증).
+- 계산이 실시간을 못 따라가면 한 번에 최대 64틱까지만 따라잡고 밀린 시간은 버린다.
 
 ## 5. 재현성 원칙
 
 - 고정 dt 틱, 틱 번호 기반 진행. 실시간 경과는 "몇 틱을 돌릴지"에만 영향.
 - 순회 순서는 항상 배열 순서(행 우선·인덱스 오름차순). `Dictionary` 순회 결과에 의존하지 않는다.
 - 난수가 필요해지면 시드 고정 자체 PRNG만 사용(`System.Random` 금지).
+- 재현성 범위: **같은 빌드·같은 실행 환경에서 비트 단위로 같은 결과**. 냄새 계산은 단일 스레드, 고정 순서다.
+  실험 파일을 저장 후 이어서 실행한 결과 = 끊김 없이 실행한 결과(테스트로 검증).
 - `World.ComputeContentHash()`로 상태를 비교한다. 월드 좌표 순서로 계산하므로 청크 크기와 무관하다.

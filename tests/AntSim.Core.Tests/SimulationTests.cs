@@ -132,6 +132,18 @@ public class SimulationHostTests
     }
 
     [Fact]
+    public async Task Tick_ReflectsSessionAfterExclusiveWork()
+    {
+        using var host = new SimulationHost(new SimulationSession(SimulationSessionTests.SampleWorld(), ScentSettings.Default));
+        await host.RunExclusiveAsync(s =>
+        {
+            s.Step(7);
+            return true;
+        }).WaitAsync(Timeout);
+        Assert.Equal(7, host.Tick);
+    }
+
+    [Fact]
     public async Task Reset_GoesBackToTickZero()
     {
         using var host = new SimulationHost(new SimulationSession(SimulationSessionTests.SampleWorld(), ScentSettings.Default));

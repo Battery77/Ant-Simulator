@@ -1,6 +1,8 @@
 using System.Diagnostics;
 using AntSim.Core.Editing;
 using AntSim.Core.Rendering;
+using AntSim.Core.Scent;
+using AntSim.Core.Simulation;
 using AntSim.Core.Serialization;
 using AntSim.Core.Worlds;
 
@@ -98,10 +100,41 @@ Measure("MapSerializer.Load", () =>
 
 Measure("ComputeContentHash", () => sink += (long)world.ComputeContentHash(), config.TileCount * 2L);
 
+Measure("PassageDig ×1000 (원자적 굴착 + Undo 기록)", () =>
+{
+    var nestWorld = WorldPresets.StandardNest(config);
+    var editor = new MapEditor(nestWorld);
+    for (int i = 0; i < 1000; i++) editor.Apply(EditOp.AddPassage(2 + (i * 37) % (size - 4), 2 + (i * 91) % (size - 4)));
+}, 1000);
+
+// 냄새: 기본 설정(2종) × 2레이어, 개미집 프리셋 + 통로 2000개 + 먹이/유충 발생원.
+var scentWorld = WorldPresets.StandardNest(config);
+{
+    var editor = new MapEditor(scentWorld);
+    for (int i = 0; i < 2000; i++) editor.Apply(EditOp.AddPassage(2 + (i * 37) % (size - 4), 2 + (i * 91) % (size - 4)));
+    for (int i = 0; i < 5000; i++) editor.Apply(EditOp.SetQuantity(LayerId.Surface, (i * 13) % size, (i * 29) % size, QuantityKind.Food, 5));
+}
+var scentSession = new SimulationSession(scentWorld, ScentSettings.Default);
+scentSession.Step(5);
+double tickMs = Measure("냄새 1틱 (2종 × 2레이어)", () => scentSession.Step(), config.TileCount * 4L);
+Console.WriteLine($"  0.1초 틱 실시간 재생 시 계산 부하: {tickMs / 100:P0}");
+
+var field = scentSession.Scent.Field(0, LayerId.Surface).ToArray();
+var heat = new byte[config.TileCount * 4];
+Measure("Heatmap 래스터 (레이어 1장, 선형)", () => HeatmapRasterizer.Rasterize(field, HeatmapRasterizer.ComputeMax(field), HeatmapScale.Linear, heat), config.TileCount);
+Measure("World.Clone (시뮬레이션 시작)", () => sink += scentWorld.Clone().Passages.Count, config.TileCount * 2L);
+var expStream = new MemoryStream();
+Measure("ExperimentSerializer.Save", () =>
+{
+    expStream.SetLength(0);
+    AntSim.Core.Serialization.ExperimentSerializer.Save(scentSession, expStream);
+}, config.TileCount * 2L);
+Console.WriteLine($"  실험 파일 크기: {expStream.Length / 1024.0 / 1024.0:F2} MiB");
+
 Console.WriteLine();
 Console.WriteLine($"(sink {sink & 1})");
 
-void Measure(string name, Action action, long elements)
+double Measure(string name, Action action, long elements)
 {
     action(); // 워밍업(JIT)
     var samples = new double[iterations];
@@ -115,4 +148,5 @@ void Measure(string name, Action action, long elements)
     double median = samples[iterations / 2];
     double nsPerElement = median * 1_000_000 / elements;
     Console.WriteLine($"| {name,-42} | {median,10:F3} ms | {nsPerElement,8:F2} ns/요소 |");
+    return median;
 }

@@ -37,5 +37,17 @@ public class HeatmapRasterizerTests
         Assert.Equal(0, rgba[3]);                 // 0 → 투명
         Assert.True(rgba[11] > rgba[7]);          // 클수록 불투명
         Assert.Equal(HeatmapRasterizer.Color(1f), BitConverter.ToUInt32(rgba, 8));
+        Assert.Equal(HeatmapRasterizer.LutColor(0.5f), BitConverter.ToUInt32(rgba, 12));
+    }
+
+    [Fact]
+    public void TinyPositiveValues_AreVisible_AndLogPathMatchesLut()
+    {
+        var field = new[] { 1e-6f, 100f };
+        var rgba = new byte[8];
+        HeatmapRasterizer.Rasterize(field, 100, HeatmapScale.Linear, rgba);
+        Assert.NotEqual(0, rgba[3]);
+        HeatmapRasterizer.Rasterize(field, 100, HeatmapScale.Log, rgba);
+        Assert.Equal(HeatmapRasterizer.LutColor(HeatmapRasterizer.Normalize(1e-6f, 100, HeatmapScale.Log)), BitConverter.ToUInt32(rgba, 0));
     }
 }

@@ -21,6 +21,9 @@ public static class HeatmapRasterizer
         (1.00f, 0xFF, 0xF0, 0x60),
     };
 
+    // 정규화 값 t를 256단계로 양자화한 색 조회표. 0번은 투명(농도 0), t > 0은 1~255.
+    private static readonly uint[] Lut = BuildLut();
+
     public static float ComputeMax(ReadOnlySpan<float> field)
     {
         float max = 0;
@@ -50,17 +53,37 @@ public static class HeatmapRasterizer
         return TilePalette.Rgba(r, g, b, a);
     }
 
+    /// <summary>정규화 값을 조회표 색으로 바꾼다(0은 투명, 0보다 크면 최소 1단계).</summary>
+    public static uint LutColor(float t) => t > 0 ? Lut[Math.Max(1, (int)(t * 255 + 0.5f))] : 0;
+
     public static void Rasterize(ReadOnlySpan<float> field, float max, HeatmapScale scale, Span<byte> rgba)
     {
         if (rgba.Length < field.Length * 4) throw new ArgumentException("픽셀 버퍼가 너무 작습니다.", nameof(rgba));
-        for (int i = 0; i < field.Length; i++)
+        var pixels = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, uint>(rgba);
+        if (!(max > 0))
         {
-            uint c = Color(Normalize(field[i], max, scale));
-            int o = i * 4;
-            rgba[o] = (byte)c;
-            rgba[o + 1] = (byte)(c >> 8);
-            rgba[o + 2] = (byte)(c >> 16);
-            rgba[o + 3] = (byte)(c >> 24);
+            pixels[..field.Length].Clear();
+            return;
         }
+        if (scale == HeatmapScale.Linear)
+        {
+            float inv = 255f / max;
+            for (int i = 0; i < field.Length; i++)
+            {
+                float v = field[i];
+                pixels[i] = v > 0 ? Lut[Math.Clamp((int)(v * inv + 0.5f), 1, 255)] : 0;
+            }
+        }
+        else
+        {
+            for (int i = 0; i < field.Length; i++) pixels[i] = LutColor(Normalize(field[i], max, scale));
+        }
+    }
+
+    private static uint[] BuildLut()
+    {
+        var lut = new uint[256];
+        for (int i = 1; i < 256; i++) lut[i] = Color(i / 255f);
+        return lut;
     }
 }

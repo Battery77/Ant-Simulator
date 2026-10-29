@@ -104,7 +104,6 @@ public sealed class SimulationHost : IDisposable
         return RunExclusiveAsync(session =>
         {
             session.Reset();
-            Interlocked.Exchange(ref _tick, session.Tick);
             return true;
         });
     }
@@ -123,15 +122,21 @@ public sealed class SimulationHost : IDisposable
         {
             _commands.Enqueue(() =>
             {
+                T result;
                 try
                 {
-                    completion.SetResult(work(_session));
+                    result = work(_session);
                 }
                 catch (Exception e)
                 {
                     completion.SetException(e);
+                    _publishRequested = true;
+                    return;
                 }
+                // 작업이 세션을 진행시켰을 수 있으므로 공개 틱을 먼저 갱신한 뒤 완료를 알린다.
+                Interlocked.Exchange(ref _tick, _session.Tick);
                 _publishRequested = true;
+                completion.SetResult(result);
             });
         }
         _wake.Set();
