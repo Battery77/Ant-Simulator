@@ -75,11 +75,16 @@ public static class MapSerializer
         return Load(file, chunkSize);
     }
 
+    /// <summary>
+    /// 스트림의 현재 위치에서 맵 레코드 하나를 읽는다. 체크섬(레코드의 마지막 8바이트)을 읽은 직후 반환하며 그 뒤는 읽지 않으므로,
+    /// 같은 스트림에 이어진 다음 레코드를 다시 Load할 수 있다(seek 가능 여부와 무관). 형식 오류는 <see cref="MapFormatException"/>.
+    /// </summary>
     public static World Load(Stream stream, int chunkSize = WorldConfig.DefaultChunkSize)
     {
         ArgumentNullException.ThrowIfNull(stream);
-        // 남은 길이를 알 수 없는 스트림은 실제 데이터만큼만 버퍼링해 길이 검증이 가능하게 한다(E01).
-        stream = StreamLimits.EnsureKnownLength(stream);
+        // 크기 필드를 믿고 큰 배열을 먼저 만들지 않도록 매 단계 실제로 남은(seek 불가면 실제로 받은) 바이트와 비교한다(F01/E01).
+        // 레코드 하나만 읽고 체크섬 직후에서 멈춘다(끝까지 미리 읽지 않음, N01).
+        stream = StreamLimits.ForRecord(stream);
         var reader = new ChecksumReader(stream);
 
         Span<byte> magic = stackalloc byte[8];

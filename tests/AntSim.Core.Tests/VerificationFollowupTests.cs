@@ -10,6 +10,44 @@ namespace AntSim.Core.Tests;
 // PR #2 독립 재검증(da05632)에서 재현된 결함 F02(종료/실행권 경합), F03(농도 상한 경계), N01(non-seek 과잉 읽기)의 회귀 테스트.
 // 각 테스트는 올바른 계약을 기대한다(결함 관찰값을 확인하는 재현 하네스와 반대).
 
+/// <summary>
+/// 읽은 바이트를 세는 seek 불가 스트림. <c>boundary</c>를 넘어서 읽으려 하면 예외(레코드 끝 이후 읽기 감시),
+/// <c>maxPerRead</c>로 한 번에 돌려주는 바이트 수를 제한한다(부분 읽기).
+/// </summary>
+internal sealed class RecordingStream(byte[] data, int? boundary = null, int maxPerRead = int.MaxValue) : Stream
+{
+    public int Consumed { get; private set; }
+    public int Reads { get; private set; }
+    public int Overreads { get; private set; }
+
+    public override int Read(byte[] buffer, int offset, int count) => Read(buffer.AsSpan(offset, count));
+
+    public override int Read(Span<byte> buffer)
+    {
+        Reads++;
+        if (boundary is int end && Consumed >= end && buffer.Length > 0)
+        {
+            Overreads++;
+            throw new IOException("레코드 끝 이후 읽기 시도");
+        }
+        int n = Math.Min(Math.Min(buffer.Length, maxPerRead), data.Length - Consumed);
+        if (boundary is int limit) n = Math.Min(n, limit - Consumed);
+        data.AsSpan(Consumed, n).CopyTo(buffer);
+        Consumed += n;
+        return n;
+    }
+
+    public override bool CanRead => true;
+    public override bool CanSeek => false;
+    public override bool CanWrite => false;
+    public override long Length => throw new NotSupportedException();
+    public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+    public override void Flush() { }
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+}
+
 public class VerificationF02DisposeRaceTests
 {
     private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(5);
@@ -447,5 +485,191 @@ public class VerificationF03ConcentrationBoundaryTests(ITestOutputHelper output)
 
         static double Total(ScentState s) =>
             s.Field(0, LayerId.Surface).ToArray().Sum(v => (double)v) + s.Field(0, LayerId.Nest).ToArray().Sum(v => (double)v);
+    }
+}
+
+public class VerificationN01RecordBoundaryTests(ITestOutputHelper output)
+{
+    private static World MapA() => TestWorlds.Create(5, 5);
+
+    private static World MapB()
+    {
+        var world = TestWorlds.Create(6, 5);
+        Assert.Equal(WorldError.None, world.TrySetPassage(2, 2, true));
+        return world;
+    }
+
+    private static SimulationSession ExpA() => new(MapA(), ScentSettings.Default);
+
+    private static SimulationSession ExpB()
+    {
+        var session = new SimulationSession(MapB(), ScentSettings.Default);
+        session.Scent.MutableField(0, LayerId.Surface)[3] = 5f;
+        session.Step();
+        return session;
+    }
+
+    private static byte[] Bytes(Action<Stream> save)
+    {
+        using var stream = new MemoryStream();
+        save(stream);
+        return stream.ToArray();
+    }
+
+    public static IEnumerable<object[]> Kinds() => new[] { new object[] { "map" }, new object[] { "exp" } };
+
+    private static (byte[] A, byte[] B, ulong HashA, ulong HashB, Func<Stream, ulong> Load) Records(string kind)
+    {
+        if (kind == "map")
+        {
+            World a = MapA(), b = MapB();
+            return (Bytes(s => MapSerializer.Save(a, s)), Bytes(s => MapSerializer.Save(b, s)), a.ComputeContentHash(), b.ComputeContentHash(),
+                s => MapSerializer.Load(s).ComputeContentHash());
+        }
+        SimulationSession ea = ExpA(), eb = ExpB();
+        return (Bytes(s => ExperimentSerializer.Save(ea, s)), Bytes(s => ExperimentSerializer.Save(eb, s)), ea.ComputeStateHash(), eb.ComputeStateHash(),
+            s => ExperimentSerializer.Load(s).ComputeStateHash());
+    }
+
+    /// <summary>테스트 A/B — 연속된 두 레코드를 seek 불가 스트림에서 차례로 불러온다. 첫 Load는 A의 끝에서 정확히 멈춘다.</summary>
+    [Theory]
+    [MemberData(nameof(Kinds))]
+    public void TwoConsecutiveRecords_NonSeekable_EachLoadConsumesExactlyOneRecord(string kind)
+    {
+        var (a, b, hashA, hashB, load) = Records(kind);
+        Assert.NotEqual(hashA, hashB);
+        var stream = new RecordingStream(a.Concat(b).ToArray());
+
+        Assert.Equal(hashA, load(stream));
+        Assert.Equal(a.Length, stream.Consumed);
+        Assert.Equal(hashB, load(stream));
+        Assert.Equal(a.Length + b.Length, stream.Consumed);
+        output.WriteLine($"{kind}: A={a.Length} B={b.Length}, 첫 Load 소비 {a.Length}, 두 번째 Load 후 {stream.Consumed}, Read {stream.Reads}회");
+
+        // seek 가능한 스트림도 같은 계약.
+        var seekable = new MemoryStream(a.Concat(b).ToArray());
+        Assert.Equal(hashA, load(seekable));
+        Assert.Equal(a.Length, seekable.Position);
+        Assert.Equal(hashB, load(seekable));
+    }
+
+    /// <summary>테스트 C — 체크섬까지 읽으면 바로 반환한다(레코드 끝 이후 Read 시도 0회).</summary>
+    [Theory]
+    [MemberData(nameof(Kinds))]
+    public void NoReadAfterChecksum(string kind)
+    {
+        var (a, _, hashA, _, load) = Records(kind);
+        var stream = new RecordingStream(a, boundary: a.Length);
+        Assert.Equal(hashA, load(stream));
+        Assert.Equal(a.Length, stream.Consumed);
+        Assert.Equal(0, stream.Overreads);
+    }
+
+    /// <summary>테스트 D — 잘못된 매직 값은 첫 8바이트만 읽고 거부한다(뒤의 본문을 버퍼링하지 않는다).</summary>
+    [Theory]
+    [MemberData(nameof(Kinds))]
+    public void BadMagic_IsRejectedAfterEightBytes(string kind)
+    {
+        var (_, _, _, _, load) = Records(kind);
+        var garbage = new byte[4096];
+        garbage.AsSpan(0, 8).Fill((byte)'Z');
+        var stream = new RecordingStream(garbage);
+        Assert.Throws<MapFormatException>(() => load(stream));
+        Assert.Equal(8, stream.Consumed);
+    }
+
+    /// <summary>테스트 E — Read가 요청보다 적게(1바이트, 3바이트씩) 돌려줘도 정상으로 불러오고 경계를 지킨다.</summary>
+    [Theory]
+    [InlineData("map", 1)]
+    [InlineData("map", 3)]
+    [InlineData("exp", 1)]
+    [InlineData("exp", 3)]
+    public void PartialReads_LoadCorrectly(string kind, int maxPerRead)
+    {
+        var (a, b, hashA, hashB, load) = Records(kind);
+        var stream = new RecordingStream(a.Concat(b).ToArray(), maxPerRead: maxPerRead);
+        Assert.Equal(hashA, load(stream));
+        Assert.Equal(a.Length, stream.Consumed);
+        Assert.Equal(hashB, load(stream));
+    }
+
+    /// <summary>체크섬·내장 구간 길이 검증은 seek 불가 경로에서도 유지된다.</summary>
+    [Theory]
+    [MemberData(nameof(Kinds))]
+    public void CorruptedRecord_NonSeekable_IsRejectedByChecksum(string kind)
+    {
+        var (a, _, _, _, load) = Records(kind);
+        var corrupted = (byte[])a.Clone();
+        corrupted[^12] ^= 0x01; // 체크섬 바로 앞 본문 1비트
+        Assert.Throws<MapFormatException>(() => load(new RecordingStream(corrupted)));
+    }
+
+    [Fact]
+    public void EmbeddedWorldLengthMismatch_NonSeekable_IsRejected()
+    {
+        var map = Bytes(s => MapSerializer.Save(MapA(), s));
+        var bytes = AuditFiles.Experiment(1, map.Concat(new byte[] { 0, 0, 0, 0 }).ToArray(), map, null);
+        Assert.Throws<MapFormatException>(() => ExperimentSerializer.Load(new RecordingStream(bytes)));
+    }
+
+    // ---- 테스트 F — F01/E01 방어(작은 입력, seek / non-seek 모두) ----
+
+    private static int EmbeddedLengthOffset(byte[] experiment)
+    {
+        using var reader = new BinaryReader(new MemoryStream(experiment));
+        reader.BaseStream.Position = 36;
+        int types = reader.ReadInt32();
+        for (int i = 0; i < types; i++)
+        {
+            reader.ReadBytes(reader.ReadInt32());
+            reader.ReadBytes(reader.ReadInt32());
+            reader.ReadBytes(34);
+        }
+        return (int)reader.BaseStream.Position;
+    }
+
+    public static IEnumerable<object[]> SecurityCases()
+    {
+        foreach (var seekable in new[] { true, false })
+        {
+            yield return new object[] { "huge-embedded", seekable };
+            yield return new object[] { "truncated-scent", seekable };
+            yield return new object[] { "header-only-16384", seekable };
+        }
+    }
+
+    [Theory]
+    [MemberData(nameof(SecurityCases))]
+    public void SmallMaliciousInputs_AreRejectedCheaply(string name, bool seekable)
+    {
+        var valid = Bytes(s => ExperimentSerializer.Save(ExpA(), s));
+        byte[] input;
+        bool isMap = false;
+        switch (name)
+        {
+            case "huge-embedded":
+                int offset = EmbeddedLengthOffset(valid);
+                input = valid[..(offset + 4)];
+                BinaryPrimitives.WriteInt32LittleEndian(input.AsSpan(offset), 1_500_000_000);
+                break;
+            case "truncated-scent":
+                input = valid[..^16];
+                break;
+            default:
+                input = Bytes(s => MapSerializer.Save(MapA(), s))[..25];
+                BinaryPrimitives.WriteInt32LittleEndian(input.AsSpan(12), 16384);
+                BinaryPrimitives.WriteInt32LittleEndian(input.AsSpan(16), 16384);
+                isMap = true;
+                break;
+        }
+        Stream stream = seekable ? new MemoryStream(input) : new RecordingStream(input);
+        var (allocated, error) = AuditFiles.Measure(() =>
+        {
+            if (isMap) MapSerializer.Load(stream);
+            else ExperimentSerializer.Load(stream);
+        });
+        output.WriteLine($"{name} seek={seekable}: input {input.Length} bytes, allocated {allocated} bytes, {error?.GetType().Name}: {error?.Message}");
+        Assert.IsType<MapFormatException>(error);
+        Assert.True(allocated < 1024 * 1024, $"거부 전 할당 {allocated}바이트");
     }
 }
