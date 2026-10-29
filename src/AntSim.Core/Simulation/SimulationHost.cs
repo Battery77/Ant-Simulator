@@ -103,7 +103,8 @@ public sealed class SimulationHost : IDisposable
     private Exception? _failure;
 
     /// <summary>
-    /// 테스트 전용 동기화 지점. 계산 스레드가 "tick"(재생 틱 직후), "publish"(스냅샷 게시 시작)에서 호출한다.
+    /// 테스트 전용 동기화 지점. 계산 스레드가 "tick"(재생 틱 직후), "publish"(스냅샷 게시 시작),
+    /// "before-dequeue"(다음 명령을 꺼내려고 lock을 잡기 직전)에서 호출한다.
     /// 경쟁 조건을 시간 지연 없이 재현하기 위해 쓴다. 운영 코드에서는 설정하지 않는다.
     /// </summary>
     internal volatile Action<string>? TestHook;
@@ -350,14 +351,20 @@ public sealed class SimulationHost : IDisposable
         lock (_gate) return _commands.Count > 0;
     }
 
+    /// <summary>
+    /// 대기 명령을 차례로 실행한다. 상태 확인과 큐에서 꺼내기를 같은 lock 안에서 한 번에 결정한다:
+    /// 꺼낸 명령은 실행권을 얻은 것이고(Dispose와 무관하게 끝까지 실행), Dispose가 먼저 Stopping으로 바꾸면 더 꺼내지 않는다
+    /// (남은 명령은 <see cref="TerminatePending"/>이 취소). 콜백 실행과 Task 완료는 lock 밖에서 한다.
+    /// </summary>
     private void DrainCommands()
     {
-        while (!_disposed)
+        while (true)
         {
+            TestHook?.Invoke("before-dequeue");
             PendingCommand command;
             lock (_gate)
             {
-                if (!_commands.TryDequeue(out command!)) return;
+                if (_state != HostState.Running || !_commands.TryDequeue(out command!)) return;
             }
             command.Execute(this);
         }
