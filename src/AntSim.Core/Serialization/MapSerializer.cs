@@ -25,6 +25,10 @@ public static class MapSerializer
     public const ushort CurrentVersion = 1;
     private static ReadOnlySpan<byte> Magic => "ANTMAP\0\0"u8;
 
+    /// <summary>이 월드를 맵 형식으로 저장했을 때의 바이트 수(헤더 25 + 평면 + 통로 + 체크섬).</summary>
+    public static long EncodedLength(World world) =>
+        25 + (long)World.LayerCount * TileEnums.PlaneCount * world.Config.TileCount + 4 + 4L * world.Passages.Count + 8;
+
     public static void Save(World world, Stream stream)
     {
         ArgumentNullException.ThrowIfNull(world);
@@ -74,6 +78,8 @@ public static class MapSerializer
     public static World Load(Stream stream, int chunkSize = WorldConfig.DefaultChunkSize)
     {
         ArgumentNullException.ThrowIfNull(stream);
+        // 남은 길이를 알 수 없는 스트림은 실제 데이터만큼만 버퍼링해 길이 검증이 가능하게 한다(E01).
+        stream = StreamLimits.EnsureKnownLength(stream);
         var reader = new ChecksumReader(stream);
 
         Span<byte> magic = stackalloc byte[8];
@@ -103,6 +109,11 @@ public static class MapSerializer
         if (layerCount != World.LayerCount)
             throw new MapFormatException($"레이어 수가 잘못되었습니다: {layerCount}.");
 
+        // 월드·임시 평면을 만들기 전에, 헤더가 선언한 크기의 본문이 실제로 있는지 확인한다(E01).
+        // 최소 본문 = 레이어 × 평면 × 타일 + 통로 수(4) + 체크섬(8). long으로 계산해 넘침이 없다.
+        long minimumBody = (long)World.LayerCount * TileEnums.PlaneCount * config.TileCount + 4 + 8;
+        StreamLimits.Require(stream, minimumBody, "맵 본문");
+
         var world = new World(config, rules);
         int tiles = config.TileCount;
         var planes = new byte[TileEnums.PlaneCount][];
@@ -129,6 +140,7 @@ public static class MapSerializer
 
         int passageCount = reader.ReadInt32();
         if (passageCount < 0 || passageCount > tiles) throw new MapFormatException($"통로 수가 잘못되었습니다: {passageCount}.");
+        StreamLimits.Require(stream, 4L * passageCount + 8, "통로 목록");
         int previous = -1;
         for (int n = 0; n < passageCount; n++)
         {

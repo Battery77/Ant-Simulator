@@ -75,6 +75,12 @@ public sealed class ScentSystem
 
     private void Diffuse(float[] cur, float[] next, byte[] open, float a)
     {
+        if (a == 0)
+        {
+            // 확산 계수 0: 이웃 차이를 계산하지 않는다(c + 0·Σ와 같은 값이며, 큰 농도에서 Σ가 넘쳐 0·∞ = NaN이 되는 연산을 피한다).
+            for (int i = 0; i < cur.Length; i++) next[i] = open[i] != 0 ? cur[i] : 0;
+            return;
+        }
         int w = _world.Config.Width, h = _world.Config.Height;
         for (int y = 0; y < h; y++)
         {

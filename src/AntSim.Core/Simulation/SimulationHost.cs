@@ -30,6 +30,9 @@ public sealed class ScentSnapshot
     public long Tick { get; internal set; }
     public double ElapsedSeconds { get; internal set; }
 
+    /// <summary>게시 시점의 초기화 세대(<see cref="SimulationSession.ResetCount"/>).</summary>
+    public long ResetCount { get; internal set; }
+
     public bool Contains(int type) => Array.IndexOf(_types, type) >= 0;
 
     /// <summary>종류 <paramref name="type"/>의 농도 배열(W×H). 포함되지 않았으면 예외.</summary>
@@ -83,11 +86,12 @@ public sealed class SimulationHost : IDisposable
     private readonly SimulationSession _session;
     private readonly Thread _thread;
     private readonly object _gate = new();
-    private readonly Queue<Action> _commands = new();
+    private readonly Queue<PendingCommand> _commands = new();
     private readonly Stack<ScentSnapshot> _freeSnapshots = new();
     private readonly AutoResetEvent _wake = new(false);
     private ScentSnapshot? _latest;
     private volatile bool _disposed;
+    private HostState _state = HostState.Running; // _gate로 보호
     private volatile bool _playing;
     private double _speed = 1;
     private int[] _heatmapTypes = { 0 };
@@ -97,6 +101,15 @@ public sealed class SimulationHost : IDisposable
     private long _tick;
     private double _lastTickMilliseconds;
     private Exception? _failure;
+
+    /// <summary>
+    /// 테스트 전용 동기화 지점. 계산 스레드가 "tick"(재생 틱 직후), "publish"(스냅샷 게시 시작)에서 호출한다.
+    /// 경쟁 조건을 시간 지연 없이 재현하기 위해 쓴다. 운영 코드에서는 설정하지 않는다.
+    /// </summary>
+    internal volatile Action<string>? TestHook;
+
+    /// <summary>테스트 전용: Dispose가 요청되었는지.</summary>
+    internal bool DisposeRequested => _disposed;
 
     public SimulationHost(SimulationSession session)
     {
@@ -152,14 +165,17 @@ public sealed class SimulationHost : IDisposable
         });
     }
 
-    /// <summary>시작 상태로 초기화하고 일시정지한다.</summary>
-    public Task ResetAsync()
+    /// <summary>
+    /// 시작 상태로 초기화하고 일시정지한다. 결과에는 초기화된 계산 월드를 같은 틱 경계에서 복제한
+    /// 표시용 월드와 초기화 세대가 들어 있다(화면이 계산 월드와 같은 상태를 그리도록).
+    /// </summary>
+    public Task<SimulationResetResult> ResetAsync()
     {
         _playing = false;
         return RunExclusiveAsync(session =>
         {
             session.Reset();
-            return true;
+            return new SimulationResetResult(session.World.Clone(), session.ResetCount, session.Tick);
         });
     }
 
@@ -167,35 +183,31 @@ public sealed class SimulationHost : IDisposable
     public Task<IReadOnlyList<string>> SetSettingsAsync(Scent.ScentSettings settings) =>
         RunExclusiveAsync(session => session.TrySetSettings(settings));
 
-    /// <summary>틱 사이에 계산 스레드에서 세션에 대한 작업을 실행한다(저장 등).</summary>
+    /// <summary>
+    /// 틱 사이에 계산 스레드에서 세션에 대한 작업을 실행한다(저장 등).
+    /// <para>명령 계약: 접수된 명령의 Task는 반드시 성공·실패·취소 중 하나로 끝난다.</para>
+    /// <list type="bullet">
+    /// <item>종료(Dispose)되었거나 계산 스레드가 실패한 호스트는 새 명령을 즉시 거부한다
+    /// (<see cref="ObjectDisposedException"/> / <see cref="InvalidOperationException"/>).</item>
+    /// <item>Dispose 시 실행 중인 명령은 끝까지 실행하고, 아직 시작하지 않은 명령은 취소된다.</item>
+    /// <item>계산 스레드가 실패하면 대기 중인 명령은 그 예외로 실패한다.</item>
+    /// <item><paramref name="work"/>가 예외를 던져도 이미 바뀐 세션 상태는 되돌리지 않는다(롤백 없음).
+    /// 공개 <see cref="Tick"/>은 성공·실패와 무관하게 Task 완료 전에 세션과 맞춘다.</item>
+    /// </list>
+    /// </summary>
     public Task<T> RunExclusiveAsync<T>(Func<SimulationSession, T> work)
     {
         ArgumentNullException.ThrowIfNull(work);
-        ObjectDisposedException.ThrowIf(_disposed, this);
-        var completion = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var command = new PendingCommand<T>(work);
         lock (_gate)
         {
-            _commands.Enqueue(() =>
-            {
-                T result;
-                try
-                {
-                    result = work(_session);
-                }
-                catch (Exception e)
-                {
-                    completion.SetException(e);
-                    _publishRequested = true;
-                    return;
-                }
-                // 작업이 세션을 진행시켰을 수 있으므로 공개 틱을 먼저 갱신한 뒤 완료를 알린다.
-                Interlocked.Exchange(ref _tick, _session.Tick);
-                _publishRequested = true;
-                completion.SetResult(result);
-            });
+            if (_state == HostState.Faulted)
+                throw new InvalidOperationException("계산 스레드가 실패해 명령을 받을 수 없습니다.", _failure);
+            ObjectDisposedException.ThrowIf(_state != HostState.Running, this);
+            _commands.Enqueue(command);
         }
         _wake.Set();
-        return completion.Task;
+        return command.Task;
     }
 
     /// <summary>히트맵으로 게시할 냄새 종류 하나와 레이어를 고른다(단일 히트맵).</summary>
@@ -234,13 +246,22 @@ public sealed class SimulationHost : IDisposable
         lock (_gate) _freeSnapshots.Push(snapshot);
     }
 
+    /// <summary>
+    /// 계산 스레드를 멈춘다. 실행 중인 명령·틱은 끝까지 마치고, 아직 시작하지 않은 명령은 취소한다.
+    /// 여러 번 호출해도 안전하다. (대기 이벤트는 다른 스레드의 Play/Pause 호출과 경합하지 않도록 해제하지 않는다.)
+    /// </summary>
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
+        lock (_gate)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            if (_state == HostState.Running) _state = HostState.Stopping;
+        }
         _wake.Set();
-        _thread.Join();
-        _wake.Dispose();
+        if (Thread.CurrentThread != _thread) _thread.Join();
+        // 계산 스레드가 시작 전에 끝났거나 이미 실패한 경우에도 남은 명령이 없도록 한 번 더 정리한다.
+        TerminatePending(HostState.Stopped, failure: null);
     }
 
     private void Run()
@@ -266,6 +287,7 @@ public sealed class SimulationHost : IDisposable
                     while (owedSimulationSeconds >= dt && ticks < MaxCatchUpTicks && _playing && !_disposed)
                     {
                         RunTick(_session);
+                        TestHook?.Invoke("tick");
                         owedSimulationSeconds -= dt;
                         ticks++;
                         if (HasPendingCommands()) break;
@@ -292,7 +314,27 @@ public sealed class SimulationHost : IDisposable
         {
             Volatile.Write(ref _failure, e);
             _playing = false;
+            TerminatePending(HostState.Faulted, e);
+            return;
         }
+        TerminatePending(HostState.Stopped, failure: null);
+    }
+
+    /// <summary>
+    /// 상태를 바꾸고(같은 lock 안에서 새 명령 접수를 막는다) 아직 시작하지 않은 명령을 모두 종결한다.
+    /// 종료면 취소, 실패면 그 예외로 실패. 완료 처리는 lock 밖에서 하며 TrySet 계열이라 중복 완료가 없다.
+    /// </summary>
+    private void TerminatePending(HostState state, Exception? failure)
+    {
+        PendingCommand[] pending;
+        lock (_gate)
+        {
+            if (_state != HostState.Faulted) _state = state;
+            pending = _commands.ToArray();
+            _commands.Clear();
+        }
+        var reason = failure is null ? null : new InvalidOperationException("계산 스레드가 실패해 명령이 실행되지 않았습니다.", failure);
+        foreach (var command in pending) command.Abandon(reason);
     }
 
     private void RunTick(SimulationSession session)
@@ -310,19 +352,76 @@ public sealed class SimulationHost : IDisposable
 
     private void DrainCommands()
     {
-        while (true)
+        while (!_disposed)
         {
-            Action command;
+            PendingCommand command;
             lock (_gate)
             {
                 if (!_commands.TryDequeue(out command!)) return;
             }
-            command();
+            command.Execute(this);
+        }
+    }
+
+    /// <summary>명령 실행 후(성공·실패 무관) 공개 상태를 세션과 맞춘다. Task 완료 전에 호출된다.</summary>
+    private void AfterCommand()
+    {
+        Interlocked.Exchange(ref _tick, _session.Tick);
+        _publishRequested = true;
+    }
+
+    private enum HostState
+    {
+        Running,
+        Stopping,
+        Stopped,
+        Faulted,
+    }
+
+    private abstract class PendingCommand
+    {
+        public abstract void Execute(SimulationHost host);
+
+        /// <summary>실행하지 않고 종결한다. reason이 없으면 취소, 있으면 실패.</summary>
+        public abstract void Abandon(Exception? reason);
+    }
+
+    private sealed class PendingCommand<T>(Func<SimulationSession, T> work) : PendingCommand
+    {
+        private readonly TaskCompletionSource<T> _completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task<T> Task => _completion.Task;
+
+        public override void Execute(SimulationHost host)
+        {
+            T result = default!;
+            Exception? error = null;
+            try
+            {
+                result = work(host._session);
+            }
+            catch (Exception e)
+            {
+                error = e;
+            }
+            finally
+            {
+                host.AfterCommand(); // 실패해도 이미 진행된 세션 상태를 공개 Tick에 반영(F07)
+            }
+            if (error is null) _completion.TrySetResult(result);
+            else _completion.TrySetException(error);
+        }
+
+        public override void Abandon(Exception? reason)
+        {
+            if (reason is null) _completion.TrySetCanceled();
+            else _completion.TrySetException(reason);
         }
     }
 
     private void Publish()
     {
+        TestHook?.Invoke("publish");
         int[] requested;
         LayerId layer;
         ScentSnapshot? snapshot;
@@ -344,6 +443,7 @@ public sealed class SimulationHost : IDisposable
         snapshot.Fill(types[..count], _session.Scent, layer);
         snapshot.Tick = _session.Tick;
         snapshot.ElapsedSeconds = _session.ElapsedSeconds;
+        snapshot.ResetCount = _session.ResetCount;
 
         lock (_gate)
         {
@@ -352,3 +452,9 @@ public sealed class SimulationHost : IDisposable
         }
     }
 }
+
+/// <summary>
+/// 초기화 결과. <see cref="World"/>는 초기화 직후 계산 월드를 같은 틱 경계에서 복제한 것으로, 호출자(화면)가 소유한다.
+/// <see cref="ResetCount"/>보다 작은 세대의 스냅샷은 초기화 이전 상태이므로 화면에서 버려야 한다.
+/// </summary>
+public sealed record SimulationResetResult(Worlds.World World, long ResetCount, long Tick);
