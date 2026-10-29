@@ -155,9 +155,62 @@ public partial class Main
         await ApplySettings(_scentSettings.WithTick(0.05));
         check(_scentSettings.TickSeconds == 0.05, "안정 틱 설정 적용");
 
+        await SmokeAuditFixes(check);
+
+        // F02: 저장을 요청한 직후 편집 모드로 나가도(호스트 종료) 저장 요청은 제한 시간 안에 끝나야 한다.
+        string exitSavePath = ProjectSettings.GlobalizePath("user://smoke-exit.antexp");
+        var pendingSave = SaveExperiment(exitSavePath);
         SetMode(AppMode.Edit);
+        var finished = await Task.WhenAny(pendingSave, Task.Delay(TimeSpan.FromSeconds(10)));
+        check(finished == pendingSave, "저장 직후 모드 전환: 저장 요청이 끝남(무기한 대기 없음)");
+        System.IO.File.Delete(exitSavePath);
         check(_mode == AppMode.Edit && _host is null && _panel.Visible && !_heatmap.Visible, "편집 모드 복귀");
         check(_world.ComputeContentHash() == editorWorld, "편집 모드 복귀 후 원본 그대로");
+    }
+
+    /// <summary>
+    /// 감사 수정 점검. F05: 시작·현재 월드가 다른 실험을 불러와 초기화하면 화면 월드가 계산 월드와 같아야 한다.
+    /// F01: 손상 파일을 불러오면 오류만 표시하고 기존 세션은 그대로 동작해야 한다.
+    /// </summary>
+    private async Task SmokeAuditFixes(Action<bool, string> check)
+    {
+        // 현재 월드만 바꾼 실험 파일을 정상 저장 경로로 만든다.
+        string path = ProjectSettings.GlobalizePath("user://smoke-diverged.antexp");
+        await _host!.RunExclusiveAsync(s =>
+        {
+            var editor = new MapEditor(s.World);
+            editor.Apply(EditOp.SetTerrain(LayerId.Surface, 3, 3, Terrain.Water));
+            editor.Apply(EditOp.PlaceSolid(LayerId.Surface, 4, 3, SolidBlock.Rock));
+            editor.Apply(EditOp.SetQuantity(LayerId.Surface, 12, 12, QuantityKind.Food, 9));
+            ExperimentSerializer.Save(s, path);
+            return true;
+        });
+        LoadExperiment(path);
+        var host = _host!;
+        var (initial, current) = await host.RunExclusiveAsync(s => (s.InitialWorld.ComputeContentHash(), s.World.ComputeContentHash()));
+        check(initial != current, "시험 파일: 시작 월드 ≠ 현재 월드");
+        check(_simWorld!.ComputeContentHash() == current, "불러온 직후 화면 월드 = 현재 월드");
+
+        await ResetSimulation();
+        ulong computed = await host.RunExclusiveAsync(s => s.World.ComputeContentHash());
+        check(computed == initial, "초기화 후 계산 월드 = 시작 월드");
+        check(_simWorld!.ComputeContentHash() == computed, "초기화 후 화면 월드(_simWorld) = 계산 월드");
+        check(ReferenceEquals(_view.DisplayedWorld, _simWorld), "초기화 후 MapView가 새 화면 월드를 그림");
+        check(EditorText.DescribeTile(_simWorld!, LayerId.Surface, 3, 3).Contains("지형: 흙"), "초기화 후 타일 정보가 시작 월드 기준");
+        await StepOnce();
+        float food = await host.RunExclusiveAsync(s => s.Scent.Get(0, LayerId.Surface, 12, 12));
+        check(food == 0f, "초기화 후 다음 틱 발생원이 시작 월드 기준(현재 월드에만 있던 먹이 없음)");
+        await WaitUntil(() => _snapshot is { } s && s.Tick == 1, "초기화 후 새 스냅샷");
+        System.IO.File.Delete(path);
+
+        // 손상 파일 불러오기: 오류 표시, 기존 세션 유지
+        string broken = ProjectSettings.GlobalizePath("user://smoke-broken.antexp");
+        System.IO.File.WriteAllBytes(broken, new byte[] { (byte)'A', (byte)'N', (byte)'T', (byte)'E', (byte)'X', (byte)'P', 0, 0, 1, 0, 0, 0 });
+        LoadExperiment(broken);
+        check(_host == host, "손상 파일 불러오기 실패 후 기존 세션 유지");
+        await StepOnce();
+        check(host.Tick == 2, "기존 세션이 계속 동작");
+        System.IO.File.Delete(broken);
     }
 
     /// <summary>복합 히트맵: 단일 ↔ 복합 ↔ 숨김 전환, 레이어 전환, 전환해도 시뮬레이션 상태 불변.</summary>
