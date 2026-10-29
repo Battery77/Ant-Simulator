@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- 시뮬레이션 코어: Godot에 의존하지 않는다. Godot 프로젝트와 테스트/벤치마크가 이 라이브러리를 참조한다. -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>AntSim.Core</RootNamespace>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="AntSim.Core.Tests" />
+  </ItemGroup>
+
+</Project>
