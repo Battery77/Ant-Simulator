@@ -1,0 +1,10 @@
+bin/
+obj/
+.vs/
+.idea/
+*.user
+TestResults/
+# Godot
+.godot/
+.import/
+godot-smoke.png

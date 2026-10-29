@@ -1,0 +1,25 @@
+; Engine configuration file.
+; Godot 4 .NET 프로젝트. 시뮬레이션 코어는 ../src/AntSim.Core (Godot 비의존)에 있다.
+
+config_version=5
+
+[application]
+
+config/name="Ant Simulator"
+run/main_scene="res://Main.tscn"
+config/features=PackedStringArray("4.4", "C#", "GL Compatibility")
+
+[display]
+
+window/size/viewport_width=1600
+window/size/viewport_height=900
+
+[dotnet]
+
+project/assembly_name="AntSim.App"
+
+[rendering]
+
+renderer/rendering_method="gl_compatibility"
+renderer/rendering_method.mobile="gl_compatibility"
+textures/canvas_textures/default_texture_filter=0
