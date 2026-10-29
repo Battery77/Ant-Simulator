@@ -151,3 +151,13 @@
   `SimulationSession.ResetCount`, `SimulationSnapshot.ResetCount`, `ScentSettings.MaxTypes/MaxNameUtf8Bytes/MaxEmission`,
   `ScentState.MaxConcentration/AllValuesInSupportedRange`, `ExperimentSerializer.ValidateForSave`, `MapSerializer.EncodedLength`.
 - 자동 테스트 212(감사 직전 PR #2 head cc5d416) → 267개(신규 55개).
+
+## PR #2 독립 재검증 수정 (F02, F03, N01)
+
+- 기준 da05632. 재검증 보고서의 반례(T1~T3)를 올바른 계약을 기대하는 회귀 테스트로 옮겼다(`tests/AntSim.Core.Tests/VerificationFollowupTests.cs`).
+  신규 테스트는 수정 전 코드(격리 worktree, 테스트용 동기화 지점 한 줄만 추가)에서 Debug/Release 모두 15개 실패, 수정 후 통과.
+- F02: 명령 꺼내기 직전 상태 확인을 같은 lock 안으로 옮김(`SimulationHost.DrainCommands`). 테스트 동기화 지점 "before-dequeue" 추가.
+- F03: 감쇠·발생 단계에서 상한을 반올림 여유(64 ULP) 이내로 넘은 값만 상한으로 되돌림. 지원 범위·파일 형식은 그대로.
+- N01: `EnsureKnownLength`(끝까지 버퍼링) 제거, `LookaheadStream`으로 레코드에 필요한 바이트만 받아 검증. 파일 형식은 그대로.
+- 공개 API 변경 없음(내부 API만: `StreamLimits.ForRecord`, `LookaheadStream`, `ScentSystem.RoundingSlackUlps` 등).
+- 자동 테스트 267 → 309개.
