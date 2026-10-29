@@ -17,12 +17,13 @@ src/AntSim.Core/                 # 순수 C# 시뮬레이션 코어 (net8.0, God
   Worlds/        + WorldPresets(Empty, StandardNest), World.Clone
   Scent/         ScentSettings(검증), ScentState(종류×레이어 float 이중 버퍼), ScentSystem
   Simulation/    SimulationSession(복제 월드 실험), SimulationHost(계산 스레드)
+  Ants/          AntSettings, AntPopulation(SoA), AntSystem(이동), AntMovement(통과·경로 검사), AntSpawner, AntRandom
   Serialization/ + ExperimentSerializer(.antexp), ChecksumStreams
   Rendering/     + HeatmapRasterizer
 godot/                           # Godot 4 .NET 프로젝트 (렌더링·입력·UI만)
   project.godot, Main.tscn, AntSim.App.csproj, AntSim.App.sln
   Scripts/ Main(조립 루트·입력), Main.Simulation(시뮬레이션 모드), MapView(청크 텍스처),
-           HeatmapView, EditorCamera, EditorPanel, SimulationPanel, ModeBar, Main.SmokeTest
+           HeatmapView, AntView(MultiMesh), EditorCamera, EditorPanel, SimulationPanel, ModeBar, Main.SmokeTest
 tests/AntSim.Core.Tests/         # xUnit, Godot 없이 실행
 tools/AntSim.Benchmarks/         # 기준 성능 측정
 tools/godot-smoke-test.sh        # Godot 통합 점검 (헤드리스 / xvfb)
@@ -91,13 +92,24 @@ ScentState        { [종류][레이어] float[] Current / Next }     // 레이�
 - 팔레트(`CompositeHeatmapPalette`)는 냄새 키 → 색. 새 페로몬은 예비 색을 자동 배정하며 `Set`으로 교체할 수 있다.
 - 계산 스레드는 재생 중 스냅샷을 최대 30Hz로만 게시(명령·선택 변경·일시정지 시 즉시)한다.
 
+### 개미 (단계 A)
+
+- `AntPopulation`: 속성별 연속 배열(SoA). 개미마다 객체·Godot 노드를 만들지 않는다. 순회는 인덱스 순서.
+- 한 틱(`AntSystem.Tick`): 개체별 간격(0.5~1초 × 개체 편차)마다 현재 방향 ±30° 안에서 목표 방향 선택 → 최대 회전 속도로 회전 →
+  현재 타일 먹이+유충 수량에 따른 속도 배율(100/95/90/85%)로 부드럽게 수렴 → 격자 DDA로 경로의 모든 타일을 검사하며 이동(관통·모서리 틈 방지)
+  → 막히면 경계 앞에서 멈추고 열린 방향으로 돌아섬 → 통로 중심 타일에 새로 들어서면 확률적으로 레이어 전환.
+- 통과 가능: 흙(먹이·유충 포함) / 불가: 물, 토양, 바위, 맵 밖. 이동 능력(`AntMobility`)은 플래그라 이후 수영 등을 추가할 수 있다.
+- 결정성: 개체별 xorshift64* 난수 상태를 배열에 저장. 같은 시드·월드·설정이면 같은 결과(실험 파일 저장 후 이어서 실행해도 동일).
+- 시뮬레이션 틱 순서: 냄새 → 개미. Reset은 개미를 같은 시드로 다시 생성한다.
+- 표시: 계산 스레드가 개미 위치(이전·현재 틱)를 스냅샷(`AntFrame`)으로 게시하고, Godot `AntView`가 MultiMesh 하나로 그리며 틱 사이를 보간한다.
+
 ### 편집 / 시뮬레이션 모드
 
 | | 편집 모드 | 시뮬레이션 모드 |
 |---|---|---|
 | 월드 | 원본(`Main._world`) | 시작 시 복제(`SimulationSession`) |
 | 쓰기 | `MapEditor`(원자적 명령, Undo/Redo) | 계산 스레드의 세션만(현재는 냄새만 변함) |
-| 저장 | 맵 파일 `.antmap` (v1, 이전과 같음) | 실험 상태 파일 `.antexp` (설정·틱·시작 월드·현재 월드·냄새) |
+| 저장 | 맵 파일 `.antmap` (v1, 이전과 같음) | 실험 상태 파일 `.antexp` v2 (설정·틱·시작 월드·현재 월드·냄새·개미 설정·개미 상태). v1 파일도 읽음 |
 | 원본 반영 | — | 하지 않음. 편집 모드로 돌아가면 원본 그대로 |
 
 실행 중 임의 편집(실험 도구)은 아직 없다. 추가할 때는 `SimulationHost.RunExclusiveAsync`로 틱 사이에 세션을 바꾸는 방식이 된다.

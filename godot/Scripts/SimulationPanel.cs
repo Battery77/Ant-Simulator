@@ -1,4 +1,5 @@
 using System.Globalization;
+using AntSim.Core.Ants;
 using AntSim.Core.Rendering;
 using AntSim.Core.Scent;
 using Godot;
@@ -46,6 +47,10 @@ public partial class SimulationPanel : PanelContainer
     private SpinBox _emission = null!;
     private Label _settingsMessage = null!;
     private Label _info = null!;
+    private Label _antCount = null!;
+    private SpinBox _antInitialCount = null!;
+    private SpinBox _antSeed = null!;
+    private AntSettings _antSettings = AntSettings.Default;
     private Label _status = null!;
     private ScentSettings _pending = ScentSettings.Default;
     private bool _populating;
@@ -58,6 +63,7 @@ public partial class SimulationPanel : PanelContainer
     public event Action<HeatmapOptions>? HeatmapChanged;
     public event Action<ScentSettings>? SettingsApplyRequested;
     public event Action? SaveExperimentRequested;
+    public event Action<AntSettings>? AntSettingsApplyRequested;
     public event Action? LoadExperimentRequested;
 
     public HeatmapOptions Heatmap
@@ -100,6 +106,13 @@ public partial class SimulationPanel : PanelContainer
         root.AddChild(_speed);
         _clock = new Label();
         root.AddChild(_clock);
+
+        root.AddChild(Header("개미 (클릭: 선택)"));
+        _antCount = new Label();
+        root.AddChild(_antCount);
+        _antInitialCount = AddNumberRow(root, "개체 수", 0, AntSettings.MaxCount, 1);
+        _antSeed = AddNumberRow(root, "시드", 0, int.MaxValue, 1);
+        root.AddChild(ActionButton("개미 설정 적용 (초기화)", () => AntSettingsApplyRequested?.Invoke(PendingAntSettings)));
 
         root.AddChild(Header("히트맵"));
         _heatType = Options("끄기");
@@ -207,6 +220,22 @@ public partial class SimulationPanel : PanelContainer
             row.Text.Text = $"{name} · 표시 최대 {entry.ShownMax:0.####} {(_autoMax.ButtonPressed ? "(자동)" : "(고정)")}\n현재 최대 {entry.CurrentMax:0.####}";
         }
     }
+
+    /// <summary>입력란 값으로 만든 개미 설정(나머지 값은 현재 설정 유지).</summary>
+    public AntSettings PendingAntSettings =>
+        _antSettings with { InitialCount = (int)_antInitialCount.Value, Seed = (ulong)_antSeed.Value };
+
+    public void SetAntSettings(AntSettings settings)
+    {
+        _antSettings = settings;
+        _antInitialCount.Value = settings.InitialCount;
+        _antSeed.Value = Math.Min(settings.Seed, int.MaxValue);
+    }
+
+    /// <summary>입력란만 바꾼다(테스트·단축 조작용). 적용은 <see cref="AntSettingsApplyRequested"/>.</summary>
+    public void SetPendingAntCount(int count) => _antInitialCount.Value = count;
+
+    public void SetAntCount(string text) => _antCount.Text = text;
 
     public void SetClock(string text) => _clock.Text = text;
     public int LegendRowCount => _legendRows.Count;

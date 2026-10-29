@@ -1,3 +1,4 @@
+using AntSim.Core.Ants;
 using AntSim.Core.Editing;
 using AntSim.Core.Rendering;
 using AntSim.Core.Serialization;
@@ -134,6 +135,7 @@ public partial class Main
 
         if (ScreenshotPath is { } screenshot && HasDisplay) await CaptureSimulationScreenshot(screenshot);
         await SmokeCompositeHeatmap(check);
+        await SmokeAnts(check);
 
         string path = ProjectSettings.GlobalizePath("user://smoke-test.antexp");
         await SaveExperiment(path);
@@ -158,6 +160,161 @@ public partial class Main
         SetMode(AppMode.Edit);
         check(_mode == AppMode.Edit && _host is null && _panel.Visible && !_heatmap.Visible, "편집 모드 복귀");
         check(_world.ComputeContentHash() == editorWorld, "편집 모드 복귀 후 원본 그대로");
+    }
+
+    /// <summary>개미(단계 A): 생성·표시, 설정 적용(초기화), 단일 틱, 재생/일시정지, 통로로 지상 이동, 선택.</summary>
+    private async Task SmokeAnts(Action<bool, string> check)
+    {
+        var host = _host!;
+        await WaitUntil(() => _snapshot is not null, "개미 프레임");
+        check(_snapshot!.Ants.Count == AntSettings.Default.InitialCount, $"시작 시 개미 {AntSettings.Default.InitialCount}마리 (실제 {_snapshot.Ants.Count})");
+
+        _simPanel.SetPendingAntCount(150);
+        await ApplyAntSettings(_simPanel.PendingAntSettings with { Seed = 3 });
+        await WaitUntil(() => _snapshot is { Tick: 0 } s && s.Ants.Count == 150, "개미 150마리로 초기화");
+        check(host.Tick == 0, "개미 설정 적용 → 틱 0");
+        check(_antSettings.InitialCount == 150, "개미 설정 저장");
+        check(_simPanel.PendingAntSettings.Seed == 3, "패널에 적용된 시드 표시");
+
+        SetLayer(LayerId.Nest);
+        await NextFrame();
+        await NextFrame();
+        check(_antView.VisibleCount == 150, $"틱 0: 개미는 모두 개미집 굴착 공간에 생성 (표시 {_antView.VisibleCount})");
+        if (HasDisplay)
+        {
+            // 데이터만이 아니라 실제 화면에 그려졌는지 픽셀로 확인한다(개미 중심 = 어두운 몸통, 굴착 공간 = 밝은 흙).
+            // 컬링 결함은 카메라 구도에 따라 나타나므로 여러 구도에서 본다.
+            // 통로가 여러 곳이면 무리 사이가 비므로 첫 개미를 중심으로 잡는다.
+            var f = _snapshot!.Ants;
+            float cx = f.X[0], cy = f.Y[0];
+            foreach (var (w, h) in new[] { (24f, 16f), (28f, 16f), (56f, 32f) })
+                await CheckAntsDrawn(check, new Rect2(cx - w / 2, cy - h / 2, w, h), $"{w}×{h} 구도");
+        }
+        var start = _snapshot!.Ants.X.AsSpan(0, 150).ToArray();
+
+        for (int i = 0; i < 5; i++) await StepOnce();
+        await WaitUntil(() => _snapshot is { Tick: 5 }, "단일 틱 5회");
+        check(!_snapshot!.Ants.X.AsSpan(0, 150).ToArray().SequenceEqual(start), "단일 틱으로 개미가 움직임");
+
+        host.Speed = 50;
+        host.Play();
+        await WaitUntil(() => host.Tick >= 30, "재생으로 30틱");
+        host.Pause();
+        long playedTo = await host.RunExclusiveAsync(s => s.Tick);
+        await Wait(0.2);
+        check(await host.RunExclusiveAsync(s => s.Tick) == playedTo, "일시정지 후 개미·틱 멈춤");
+        // Debug 빌드에서 재생으로 수백 틱을 기다리면 오래 걸리므로 나머지는 직접 진행한다.
+        long paused = await host.RunExclusiveAsync(s =>
+        {
+            s.Step(300 - (int)s.Tick);
+            return s.Tick;
+        });
+        await WaitUntil(() => _snapshot is { } s && s.Tick == paused, "일시정지 스냅샷");
+        var frame = _snapshot!.Ants;
+        int onSurface = frame.CountOn(LayerId.Surface);
+        check(onSurface > 0, $"통로로 지상에 올라온 개미 {onSurface}마리");
+        bool allPassable = true;
+        for (int i = 0; i < frame.Count; i++)
+            allPassable &= AntMovement.IsPassable(_simWorld!.GetLayer((LayerId)frame.Layer[i]), frame.X[i], frame.Y[i]);
+        check(allPassable, "모든 개미가 이동 가능한 타일에 있음");
+
+        // 실제 클릭으로 지상의 개미 선택
+        SetLayer(LayerId.Surface);
+        int target = -1;
+        for (int i = 0; i < frame.Count && target < 0; i++)
+            if (frame.Layer[i] == (byte)LayerId.Surface) target = i;
+        if (target >= 0)
+        {
+            _camera.FitTo(new Rect2(frame.X[target] - 15, frame.Y[target] - 10, 30, 20));
+            await NextFrame();
+            int id = frame.Id[target];
+            if (HasDisplay)
+            {
+                // 실제 마우스 이벤트로 클릭(헤드리스 창은 입력 이벤트를 받지 못해 디스플레이 모드에서만)
+                var at = _view.GetGlobalTransformWithCanvas() * new Vector2(frame.X[target], frame.Y[target]);
+                await SendMouse(new InputEventMouseButton { ButtonIndex = MouseButton.Left, Pressed = true }, at);
+                await SendMouse(new InputEventMouseButton { ButtonIndex = MouseButton.Left, Pressed = false }, at);
+                check(_selectedAntId == id, $"클릭으로 개미 #{id} 선택 (선택됨: {_selectedAntId})");
+            }
+            else
+            {
+                check(TrySelectAnt(new Vector2(frame.X[target] + 0.2f, frame.Y[target])) && _selectedAntId == id, $"선택 로직으로 개미 #{id} 선택");
+            }
+            check(DescribeSelectedAnt()?.Contains($"개미 #{id}") == true, "선택한 개미 정보 표시");
+        }
+        else
+        {
+            check(false, "선택 시험용 지상 개미를 찾지 못함");
+        }
+
+        if (ScreenshotPath is { } screenshot && HasDisplay) await CaptureAntScreenshots(screenshot);
+        _selectedAntId = -1;
+        _simPanel.SelectHeatmap(HeatmapMode.Single, 0);
+    }
+
+    private async Task CheckAntsDrawn(Action<bool, string> check, Rect2 view, string label)
+    {
+        _camera.FitTo(view);
+        _camera.Position -= new Vector2(view.Size.X * 0.15f, 0); // 왼쪽 패널만큼
+        for (int i = 0; i < 3; i++) await NextFrame();
+        await ToSignal(RenderingServer.Singleton, RenderingServer.SignalName.FramePostDraw);
+        var image = GetViewport().GetTexture().GetImage();
+        var toScreen = _view.GetGlobalTransformWithCanvas();
+        var frame = _snapshot!.Ants;
+        int inView = 0, drawn = 0;
+        for (int i = 0; i < frame.Count; i++)
+        {
+            if (frame.Layer[i] != (byte)_view.Layer) continue;
+            var p = toScreen * new Vector2(frame.X[i], frame.Y[i]);
+            if (p.X < 450 || p.Y < 40 || p.X >= image.GetWidth() || p.Y >= image.GetHeight()) continue;
+            inView++;
+            if (image.GetPixel((int)p.X, (int)p.Y).Luminance < 0.2f) drawn++;
+        }
+        check(inView > 0 && drawn >= inView * 0.8, $"화면에 개미가 실제로 그려짐 [{label}] (개미 중심 픽셀이 몸통 색: {drawn}/{inView})");
+    }
+
+    /// <summary>같은 장면을 서로 다른 틱에서 캡처한다(히트맵 끔, 통로 5개 주변 확대).</summary>
+    private async Task CaptureAntScreenshots(string path)
+    {
+        var host = _host!;
+        _simPanel.SelectHeatmap(HeatmapMode.Hidden);
+        await ApplyAntSettings(_antSettings with { InitialCount = 150, Seed = 3 });
+        await WaitUntil(() => _snapshot is { Tick: 0 } s && s.Ants.Count == 150, "캡처용 초기화");
+        _camera.FitTo(new Rect2(84, 52, 28, 16));
+        _camera.Position -= new Vector2(4, 0);
+
+        SetLayer(LayerId.Nest);
+        await SaveScreenshot(path.Replace(".png", "-ants-t0-nest.png"));
+        SetLayer(LayerId.Surface);
+        foreach (int tick in new[] { 30, 150, 600 })
+        {
+            await host.RunExclusiveAsync(s =>
+            {
+                s.Step(tick - (int)s.Tick);
+                return true;
+            });
+            await WaitUntil(() => _snapshot is { } s && s.Tick == tick, $"틱 {tick} 스냅샷");
+            if (tick == 600)
+            {
+                // 통로 주변에서 가장 가까운 지상 개미를 선택하고 그 개미를 중심으로 찍는다(선택 정보 표시 확인).
+                var f = _snapshot!.Ants;
+                int best = -1;
+                float bestDistance = float.MaxValue;
+                for (int i = 0; i < f.Count; i++)
+                {
+                    if (f.Layer[i] != (byte)LayerId.Surface) continue;
+                    float d = new Vector2(f.X[i] - 98, f.Y[i] - 60).Length();
+                    if (d < bestDistance) { bestDistance = d; best = i; }
+                }
+                if (best >= 0)
+                {
+                    _selectedAntId = f.Id[best];
+                    _camera.FitTo(new Rect2(f.X[best] - 14, f.Y[best] - 8, 28, 16));
+                    _camera.Position -= new Vector2(4, 0);
+                }
+            }
+            await SaveScreenshot(path.Replace(".png", $"-ants-t{tick}.png"));
+        }
     }
 
     /// <summary>복합 히트맵: 단일 ↔ 복합 ↔ 숨김 전환, 레이어 전환, 전환해도 시뮬레이션 상태 불변.</summary>

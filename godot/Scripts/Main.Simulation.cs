@@ -1,3 +1,4 @@
+using AntSim.Core.Ants;
 using AntSim.Core.Editing;
 using AntSim.Core.Rendering;
 using AntSim.Core.Scent;
@@ -18,6 +19,11 @@ public partial class Main
     private const string ExperimentFileFilter = "*.antexp ; 개미 시뮬레이터 실험 상태";
 
     private HeatmapView _heatmap = null!;
+    private AntView _antView = null!;
+    private AntSettings _antSettings = AntSettings.Default;
+    private int _selectedAntId = -1;
+    private long _frameTick = -1;
+    private ulong _frameArrivalMs;
     private SimulationPanel _simPanel = null!;
     private ModeBar _modeBar = null!;
     private SimulationHost? _host;
@@ -53,6 +59,7 @@ public partial class Main
             SelectHeatmapOnHost();
         };
         _simPanel.SettingsApplyRequested += settings => _ = ApplySettings(settings);
+        _simPanel.AntSettingsApplyRequested += settings => _ = ApplyAntSettings(settings);
         _simPanel.SaveExperimentRequested += () =>
             ShowFileDialog(FileDialog.FileModeEnum.SaveFile, ExperimentFileFilter, path => _ = SaveExperiment(path));
         _simPanel.LoadExperimentRequested += () =>
@@ -74,7 +81,7 @@ public partial class Main
         SimulationSession session;
         try
         {
-            session = loaded ?? new SimulationSession(_world, _scentSettings);
+            session = loaded ?? new SimulationSession(_world, _scentSettings, _antSettings);
         }
         catch (ArgumentException e)
         {
@@ -85,6 +92,8 @@ public partial class Main
 
         // 호스트(계산 스레드)에 넘기기 전에 표시용 복제본을 만든다. 이후 세션은 계산 스레드만 다룬다.
         _scentSettings = session.Settings;
+        _antSettings = session.AntSettings;
+        var spawn = session.LastSpawn;
         _simWorld = session.World.Clone();
         _host = new SimulationHost(session) { Speed = _speed };
         _mode = AppMode.Simulation;
@@ -93,13 +102,17 @@ public partial class Main
         _simPanel.Visible = true;
         _modeBar.SetMode(AppMode.Simulation);
         _simPanel.SetSettings(_scentSettings);
+        _simPanel.SetAntSettings(_antSettings);
         _simPanel.SetSettingsMessage("");
+        _selectedAntId = -1;
+        _frameTick = -1;
         _heatmapOptions = _simPanel.Heatmap;
         _view.SetWorld(_simWorld);
+        _antView.SetWorldBounds(_simWorld.Config.Width, _simWorld.Config.Height);
         SelectHeatmapOnHost();
-        _simPanel.SetStatus(loaded is null
+        _simPanel.SetStatus((loaded is null
             ? "편집 월드를 복제해 새 실험을 시작했습니다."
-            : $"실험 상태를 불러왔습니다 (틱 {session.Tick}).");
+            : $"실험 상태를 불러왔습니다 (틱 {session.Tick}).") + SpawnText(spawn));
     }
 
     private void ExitSimulationMode()
@@ -111,6 +124,8 @@ public partial class Main
         _panel.Visible = true;
         _modeBar.SetMode(AppMode.Edit);
         _heatmap.HideHeatmap();
+        _antView.Clear();
+        _selectedAntId = -1;
         _view.SetWorld(_world);
         _panel.SetStatus("편집 모드. 시뮬레이션 결과는 원본 맵에 반영되지 않습니다.");
     }
@@ -134,7 +149,13 @@ public partial class Main
             if (_snapshot is not null) _host.Release(_snapshot);
             _snapshot = snapshot;
             _heatmapDirty = true;
+            if (snapshot.Tick != _frameTick)
+            {
+                _frameTick = snapshot.Tick;
+                _frameArrivalMs = Time.GetTicksMsec();
+            }
         }
+        UpdateAnts();
         if (_heatmapDirty)
         {
             _heatmapDirty = false;
@@ -147,12 +168,13 @@ public partial class Main
             $"틱 간격 {SimulationPanel.FormatNumber(_scentSettings.TickSeconds)}초 · 틱 계산 {_host.LastTickMilliseconds:0.0}ms" +
             (_heatmap.Visible ? $" · 히트맵 {_heatmap.LastRasterMilliseconds:0.0}ms" : ""));
 
+        string? antInfo = DescribeSelectedAnt();
         if (shown is not { } t)
         {
-            _simPanel.SetInfo("");
+            _simPanel.SetInfo(antInfo ?? "");
             return;
         }
-        string info = EditorText.DescribeTile(_simWorld, _view.Layer, t.X, t.Y);
+        string info = (antInfo is null ? "" : antInfo + "\n\n") + EditorText.DescribeTile(_simWorld, _view.Layer, t.X, t.Y);
         if (_snapshot is { } s && s.Layer == _view.Layer)
         {
             // 표시 색이 아니라 실제 농도 값을 보여 준다(복합 모드에서는 모든 냄새).
@@ -164,6 +186,83 @@ public partial class Main
         }
         _simPanel.SetInfo(info);
     }
+
+    /// <summary>개미를 그린다. 재생 중에는 마지막 틱 이후 경과 시간만큼 이전 → 현재 위치를 보간한다.</summary>
+    private void UpdateAnts()
+    {
+        if (_snapshot is not { } s || _host is null)
+        {
+            _antView.Clear();
+            return;
+        }
+        float alpha = 1;
+        if (_host.IsPlaying)
+        {
+            double tickMs = _scentSettings.TickSeconds / _host.Speed * 1000;
+            alpha = (float)Math.Clamp((Time.GetTicksMsec() - _frameArrivalMs) / tickMs, 0, 1);
+        }
+        _antView.ShowFrame(s.Ants, _view.Layer, alpha, _selectedAntId);
+        int surface = s.Ants.CountOn(LayerId.Surface);
+        _simPanel.SetAntCount($"개미 {s.Ants.Count}마리 (지상 {surface} / 개미집 {s.Ants.Count - surface}) · 이 레이어 표시 {_antView.VisibleCount}");
+    }
+
+    /// <summary>클릭 위치에서 가장 가까운 개미(현재 레이어, 1타일 이내)를 고른다. 없으면 false.</summary>
+    private bool TrySelectAnt(Vector2 worldPoint)
+    {
+        if (_snapshot is not { } s) return false;
+        var frame = s.Ants;
+        int best = -1;
+        float bestDistance = 1f;
+        for (int i = 0; i < frame.Count; i++)
+        {
+            if (frame.Layer[i] != (byte)_view.Layer) continue;
+            float d = new Vector2(frame.X[i], frame.Y[i]).DistanceTo(worldPoint);
+            if (d < bestDistance)
+            {
+                bestDistance = d;
+                best = i;
+            }
+        }
+        _selectedAntId = best >= 0 ? frame.Id[best] : -1;
+        return best >= 0;
+    }
+
+    private string? DescribeSelectedAnt()
+    {
+        if (_selectedAntId < 0 || _snapshot is not { } s) return null;
+        var f = s.Ants;
+        int i = Array.IndexOf(f.Id, _selectedAntId, 0, f.Count);
+        if (i < 0) return $"개미 #{_selectedAntId}: 없음";
+        float degrees = f.Heading[i] * 180 / MathF.PI;
+        return $"개미 #{f.Id[i]} (일개미) · {EditorText.Name((LayerId)f.Layer[i])}\n" +
+               $"위치 ({f.X[i]:0.00}, {f.Y[i]:0.00}) · 방향 {degrees:0}°\n" +
+               $"기본 속도 {f.BaseSpeed[i]:0.00} 타일/초 · 현재 {f.BaseSpeed[i] * f.SpeedFactor[i]:0.00} (×{f.SpeedFactor[i]:0.00})\n" +
+               $"외형 크기 {f.Size[i]:0.00} 타일\n" +
+               "목표·행동·성향·기억: 단계 B~D에서 추가";
+    }
+
+    private async Task ApplyAntSettings(AntSettings settings)
+    {
+        if (_host is null) return;
+        var errors = settings.Validate();
+        if (errors.Count > 0)
+        {
+            _simPanel.SetStatus(string.Join("\n", errors));
+            return;
+        }
+        var host = _host;
+        var report = await host.ResetAsync(settings);
+        if (host != _host) return;
+        _antSettings = settings;
+        _simPanel.SetAntSettings(settings);
+        _selectedAntId = -1;
+        _simPanel.SetStatus("개미 설정을 적용하고 초기화했습니다." + SpawnText(report));
+    }
+
+    private static string SpawnText(AntSpawnReport report) =>
+        report.Requested == 0 ? " 개미 없음." :
+        report.Failed == 0 ? $" 개미 {report.Spawned}마리 생성." :
+        $" 개미 {report.Spawned}/{report.Requested}마리 생성(열린 공간 부족으로 {report.Failed}마리 실패).";
 
     private void UpdateHeatmap()
     {

@@ -32,6 +32,8 @@ public partial class Main : Node
         AddChild(_view);
         _heatmap = new HeatmapView { Name = "Heatmap" };
         AddChild(_heatmap);
+        _antView = new AntView { Name = "AntView" };
+        AddChild(_antView);
         _camera = new EditorCamera { Name = "Camera" };
         AddChild(_camera);
         _camera.MakeCurrent();
@@ -90,11 +92,14 @@ public partial class Main : Node
         switch (@event)
         {
             case InputEventMouseButton { ButtonIndex: MouseButton.Left } button when _mode == AppMode.Simulation:
-                // 시뮬레이션 모드에서는 편집하지 않고 타일 정보만 고정한다.
+                // 시뮬레이션 모드에서는 편집하지 않는다. 개미 근처를 누르면 개미 선택, 아니면 타일 정보 고정.
                 if (button.Pressed)
                 {
                     var target = _view.ScreenToTile(button.Position);
+                    var point = _view.GetGlobalTransformWithCanvas().AffineInverse() * button.Position;
+                    bool antSelected = TrySelectAnt(point);
                     _pinnedTile = CurrentWorld.Config.InBounds(target.X, target.Y) ? target : null;
+                    if (antSelected) _pinnedTile = null;
                 }
                 GetViewport().SetInputAsHandled();
                 break;
@@ -138,6 +143,7 @@ public partial class Main : Node
         if (key.Keycode == Key.Escape)
         {
             _pinnedTile = null;
+            _selectedAntId = -1;
             GetViewport().SetInputAsHandled();
             return;
         }
