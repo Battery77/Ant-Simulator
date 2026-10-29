@@ -26,4 +26,8 @@
     <ProjectReference Include="..\..\src\AntSim.Core\AntSim.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Include="Fixtures\**" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

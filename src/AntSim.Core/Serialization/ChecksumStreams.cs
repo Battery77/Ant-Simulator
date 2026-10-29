@@ -40,6 +40,13 @@ internal sealed class ChecksumWriter(Stream stream)
         Write(b);
     }
 
+    public void WriteSingle(float value)
+    {
+        Span<byte> b = stackalloc byte[4];
+        BinaryPrimitives.WriteSingleLittleEndian(b, value);
+        Write(b);
+    }
+
     public void WriteDouble(double value)
     {
         Span<byte> b = stackalloc byte[8];
@@ -116,6 +123,13 @@ internal sealed class ChecksumReader(Stream stream)
         Span<byte> b = stackalloc byte[8];
         Read(b);
         return BinaryPrimitives.ReadInt64LittleEndian(b);
+    }
+
+    public float ReadSingle()
+    {
+        Span<byte> b = stackalloc byte[4];
+        Read(b);
+        return BinaryPrimitives.ReadSingleLittleEndian(b);
     }
 
     public double ReadDouble()

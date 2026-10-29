@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using AntSim.Core.Ants;
 using AntSim.Core.Scent;
 using AntSim.Core.Simulation;
 using AntSim.Core.Worlds;
@@ -8,6 +9,7 @@ namespace AntSim.Core.Serialization;
 /// <summary>
 /// 시뮬레이션 실험 상태 파일(.antexp). 맵 파일(.antmap)과 분리되어 있으며, 실험을 그대로 이어서 실행할 수 있도록
 /// 설정·틱·시작 월드·현재 월드·냄새 필드 전체를 담는다. 모든 정수·실수는 리틀 엔디언.
+/// v2는 v1 끝(냄새 다음, 체크섬 앞)에 개미 설정과 개체 상태를 추가했다. v1 파일은 개미 없이 불러온다.
 /// <code>
 /// [v1]
 /// magic        8 bytes  "ANTEXP\0\0"
@@ -22,11 +24,19 @@ namespace AntSim.Core.Serialization;
 /// currentWorld i32 length + 맵 파일 형식 바이트
 /// scent        typeCount × 레이어 2 × (width*height) × f32   (종류 순서 = settings, 레이어 순서 Surface, Nest)
 /// checksum     u64      위 모든 바이트의 FNV-1a 64
+///
+/// [v2] = v1 + (scent 다음, checksum 앞에)
+/// antSettings  i32 initialCount, u64 seed, f32 × 12 (baseSpeed, speedVariation, baseSize, sizeVariation,
+///              turnIntervalMin, turnIntervalMax, turnIntervalVariation, wanderAngle, turnRate,
+///              speedSmoothing, passageUseProbability, 예약 0), i32 tierCount, tierCount × { i32 minQuantity, f32 factor }
+/// ants         i32 count, i32 nextId, 이후 배열들(각 count개, 순서 고정):
+///              id i32, caste u8, layer u8, mobility u8, x, y, prevX, prevY, heading, targetHeading,
+///              baseSpeed, speedFactor, size, turnTimer, turnIntervalScale (f32), lastTile i32, rng u64
 /// </code>
 /// </summary>
 public static class ExperimentSerializer
 {
-    public const ushort CurrentVersion = 1;
+    public const ushort CurrentVersion = 2;
     public const int MaxScentTypes = 256;
     private static ReadOnlySpan<byte> Magic => "ANTEXP\0\0"u8;
 
@@ -65,6 +75,8 @@ public static class ExperimentSerializer
         for (int l = 0; l < World.LayerCount; l++)
             writer.Write(MemoryMarshal.AsBytes(session.Scent.Field(t, (LayerId)l)));
 
+        WriteAntSettings(writer, session.AntSettings);
+        WriteAnts(writer, session.Ants);
         writer.WriteChecksum();
     }
 
@@ -134,9 +146,107 @@ public static class ExperimentSerializer
                 if (!float.IsFinite(v) || v < 0) throw new MapFormatException("냄새 농도에 잘못된 값(음수 또는 NaN)이 있습니다.");
         }
 
+        var antSettings = AntSettings.None;
+        var ants = new AntPopulation();
+        if (version >= 2)
+        {
+            antSettings = ReadAntSettings(reader);
+            ReadAnts(reader, ants, current);
+        }
+
         reader.VerifyChecksum();
-        return new SimulationSession(initial, current, settings, scent, tick, elapsed);
+        return new SimulationSession(initial, current, settings, scent, tick, elapsed, antSettings, ants);
     }
+
+    private static void WriteAntSettings(ChecksumWriter writer, AntSettings s)
+    {
+        writer.WriteInt32(s.InitialCount);
+        writer.WriteInt64((long)s.Seed);
+        foreach (float v in new[]
+        {
+            s.BaseSpeed, s.SpeedVariation, s.BaseSize, s.SizeVariation, s.TurnIntervalMin, s.TurnIntervalMax,
+            s.TurnIntervalVariation, s.WanderAngleDegrees, s.TurnRateDegreesPerSecond, s.SpeedFactorSmoothingSeconds,
+            s.PassageUseProbability, 0f,
+        })
+            writer.WriteSingle(v);
+        writer.WriteInt32(s.QuantitySpeedTiers.Count);
+        foreach (var tier in s.QuantitySpeedTiers)
+        {
+            writer.WriteInt32(tier.MinQuantity);
+            writer.WriteSingle(tier.Factor);
+        }
+    }
+
+    private static AntSettings ReadAntSettings(ChecksumReader reader)
+    {
+        int count = reader.ReadInt32();
+        ulong seed = (ulong)reader.ReadInt64();
+        var v = new float[12];
+        for (int i = 0; i < v.Length; i++) v[i] = reader.ReadSingle();
+        int tierCount = reader.ReadInt32();
+        if (tierCount < 1 || tierCount > 256) throw new MapFormatException($"개미 속도 구간 수가 잘못되었습니다: {tierCount}.");
+        var tiers = new SpeedTier[tierCount];
+        for (int i = 0; i < tierCount; i++) tiers[i] = new SpeedTier(reader.ReadInt32(), reader.ReadSingle());
+
+        var settings = new AntSettings
+        {
+            InitialCount = count, Seed = seed,
+            BaseSpeed = v[0], SpeedVariation = v[1], BaseSize = v[2], SizeVariation = v[3],
+            TurnIntervalMin = v[4], TurnIntervalMax = v[5], TurnIntervalVariation = v[6],
+            WanderAngleDegrees = v[7], TurnRateDegreesPerSecond = v[8], SpeedFactorSmoothingSeconds = v[9],
+            PassageUseProbability = v[10], QuantitySpeedTiers = tiers,
+        };
+        var errors = settings.Validate();
+        if (errors.Count > 0) throw new MapFormatException($"개미 설정이 잘못되었습니다: {string.Join(" ", errors)}");
+        return settings;
+    }
+
+    private static void WriteAnts(ChecksumWriter writer, AntPopulation ants)
+    {
+        int n = ants.Count;
+        writer.WriteInt32(n);
+        writer.WriteInt32(ants.NextId);
+        writer.Write(MemoryMarshal.AsBytes(ants.IdArray.AsSpan(0, n)));
+        writer.Write(ants.CasteArray.AsSpan(0, n));
+        writer.Write(ants.LayerArray.AsSpan(0, n));
+        writer.Write(ants.MobilityArray.AsSpan(0, n));
+        foreach (var array in FloatArrays(ants)) writer.Write(MemoryMarshal.AsBytes(array.AsSpan(0, n)));
+        writer.Write(MemoryMarshal.AsBytes(ants.LastTileArray.AsSpan(0, n)));
+        writer.Write(MemoryMarshal.AsBytes(ants.RngArray.AsSpan(0, n)));
+    }
+
+    private static void ReadAnts(ChecksumReader reader, AntPopulation ants, World world)
+    {
+        int n = reader.ReadInt32();
+        int nextId = reader.ReadInt32();
+        if (n < 0 || n > AntSettings.MaxCount) throw new MapFormatException($"개미 수가 잘못되었습니다: {n}.");
+        ants.SetCount(n, nextId);
+        reader.Read(MemoryMarshal.AsBytes(ants.IdArray.AsSpan(0, n)));
+        reader.Read(ants.CasteArray.AsSpan(0, n));
+        reader.Read(ants.LayerArray.AsSpan(0, n));
+        reader.Read(ants.MobilityArray.AsSpan(0, n));
+        foreach (var array in FloatArrays(ants)) reader.Read(MemoryMarshal.AsBytes(array.AsSpan(0, n)));
+        reader.Read(MemoryMarshal.AsBytes(ants.LastTileArray.AsSpan(0, n)));
+        reader.Read(MemoryMarshal.AsBytes(ants.RngArray.AsSpan(0, n)));
+
+        // 불러온 개미가 규칙을 어기는 위치(맵 밖·물·고체)에 있으면 거부한다.
+        for (int i = 0; i < n; i++)
+        {
+            if (ants.IdArray[i] < 0 || ants.IdArray[i] >= nextId) throw new MapFormatException($"개미 ID가 잘못되었습니다: {ants.IdArray[i]}.");
+            if (ants.LayerArray[i] >= World.LayerCount || ants.CasteArray[i] != (byte)AntCaste.Worker || ants.MobilityArray[i] != (byte)AntMobility.Walk)
+                throw new MapFormatException($"개미 {ants.IdArray[i]}의 레이어·계급·이동 능력이 잘못되었습니다.");
+            var layer = world.GetLayer((LayerId)ants.LayerArray[i]);
+            if (!float.IsFinite(ants.XArray[i]) || !float.IsFinite(ants.YArray[i]) ||
+                !AntMovement.IsPassable(layer, ants.XArray[i], ants.YArray[i]))
+                throw new MapFormatException($"개미 {ants.IdArray[i]}이 이동할 수 없는 위치에 있습니다.");
+        }
+    }
+
+    private static float[][] FloatArrays(AntPopulation a) => new[]
+    {
+        a.XArray, a.YArray, a.PrevXArray, a.PrevYArray, a.HeadingArray, a.TargetHeadingArray,
+        a.BaseSpeedArray, a.SpeedFactorArray, a.SizeArray, a.TurnTimerArray, a.TurnIntervalScaleArray,
+    };
 
     private static void WriteWorld(ChecksumWriter writer, World world)
     {
