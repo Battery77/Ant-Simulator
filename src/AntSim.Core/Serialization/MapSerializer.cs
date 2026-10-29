@@ -1,6 +1,3 @@
-using System.Buffers.Binary;
-using System.Text;
-using AntSim.Core.Util;
 using AntSim.Core.Worlds;
 
 namespace AntSim.Core.Serialization;
@@ -41,7 +38,7 @@ public static class MapSerializer
         writer.WriteInt32(config.Width);
         writer.WriteInt32(config.Height);
         writer.WriteInt32(world.Rules.MaxQuantityPerTile);
-        writer.Write([(byte)World.LayerCount]);
+        writer.WriteByte((byte)World.LayerCount);
 
         var row = new byte[config.Width];
         foreach (var layer in world.Layers)
@@ -57,10 +54,7 @@ public static class MapSerializer
         writer.WriteInt32(indices.Count);
         foreach (int i in indices) writer.WriteInt32(i);
 
-        ulong checksum = writer.Checksum;
-        Span<byte> tail = stackalloc byte[8];
-        BinaryPrimitives.WriteUInt64LittleEndian(tail, checksum);
-        stream.Write(tail);
+        writer.WriteChecksum();
     }
 
     public static void Save(World world, string path)
@@ -105,10 +99,9 @@ public static class MapSerializer
             throw new MapFormatException($"맵 헤더 값이 잘못되었습니다: {e.Message}", e);
         }
 
-        Span<byte> layerCount = stackalloc byte[1];
-        reader.Read(layerCount);
-        if (layerCount[0] != World.LayerCount)
-            throw new MapFormatException($"레이어 수가 잘못되었습니다: {layerCount[0]}.");
+        byte layerCount = reader.ReadByte();
+        if (layerCount != World.LayerCount)
+            throw new MapFormatException($"레이어 수가 잘못되었습니다: {layerCount}.");
 
         var world = new World(config, rules);
         int tiles = config.TileCount;
@@ -146,79 +139,9 @@ public static class MapSerializer
             previous = index;
         }
 
-        ulong expected = reader.Checksum;
-        Span<byte> tail = stackalloc byte[8];
-        reader.ReadRaw(tail);
-        if (BinaryPrimitives.ReadUInt64LittleEndian(tail) != expected)
-            throw new MapFormatException("체크섬이 일치하지 않습니다. 파일이 손상되었습니다.");
+        reader.VerifyChecksum();
 
         foreach (var layer in world.Layers) layer.ClearAllDirty();
         return world;
-    }
-
-    private sealed class ChecksumWriter(Stream stream)
-    {
-        private Fnv1a64 _hash = Fnv1a64.Create();
-
-        public ulong Checksum => _hash.Value;
-
-        public void Write(ReadOnlySpan<byte> bytes)
-        {
-            _hash.Add(bytes);
-            stream.Write(bytes);
-        }
-
-        public void WriteUInt16(ushort value)
-        {
-            Span<byte> b = stackalloc byte[2];
-            BinaryPrimitives.WriteUInt16LittleEndian(b, value);
-            Write(b);
-        }
-
-        public void WriteInt32(int value)
-        {
-            Span<byte> b = stackalloc byte[4];
-            BinaryPrimitives.WriteInt32LittleEndian(b, value);
-            Write(b);
-        }
-    }
-
-    private sealed class ChecksumReader(Stream stream)
-    {
-        private Fnv1a64 _hash = Fnv1a64.Create();
-
-        public ulong Checksum => _hash.Value;
-
-        public void Read(Span<byte> buffer)
-        {
-            ReadRaw(buffer);
-            _hash.Add(buffer);
-        }
-
-        public void ReadRaw(Span<byte> buffer)
-        {
-            try
-            {
-                stream.ReadExactly(buffer);
-            }
-            catch (EndOfStreamException e)
-            {
-                throw new MapFormatException("맵 파일이 예상보다 짧습니다.", e);
-            }
-        }
-
-        public ushort ReadUInt16()
-        {
-            Span<byte> b = stackalloc byte[2];
-            Read(b);
-            return BinaryPrimitives.ReadUInt16LittleEndian(b);
-        }
-
-        public int ReadInt32()
-        {
-            Span<byte> b = stackalloc byte[4];
-            Read(b);
-            return BinaryPrimitives.ReadInt32LittleEndian(b);
-        }
     }
 }
