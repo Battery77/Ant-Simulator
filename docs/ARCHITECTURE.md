@@ -1,132 +1,108 @@
-# 아키텍처 설계
+# 아키텍처
 
-> 상태: 1단계(월드 데이터 모델) 구현 완료. 나머지 항목은 설계안이며, `OPEN_QUESTIONS.md`의 규칙이 정해지면 구체화한다.
+> Phase 1(월드 데이터 구조 + 맵 편집기) 구현 완료 기준. 냄새·시뮬레이션 스레드는 설계안이다.
+> 작업 계획·테스트·성능 측정 계획은 [`PLAN.md`](PLAN.md), 미정 규칙은 [`OPEN_QUESTIONS.md`](OPEN_QUESTIONS.md).
 
-기존 프로젝트 분석 결과: 저장소에는 `README.md`만 있었고 재사용할 코드나 교체할 아키텍처는 없었다.
-
-## 1. 프로젝트 폴더 구조
+## 1. 프로젝트 구조
 
 ```
-AntSimulator.sln
-Directory.Build.props          # 공통 빌드 설정 (nullable, 경고=오류, 결정적 빌드)
-src/
-  AntSim.Core/                 # 시뮬레이션 코어 (net8.0, Godot 의존성 없음)
-    Worlds/                    # World, WorldLayer, Chunk, WorldConfig, 좌표      [1단계 ✅]
-    Content/                   # TypeRegistry (타일·블록·냄새 타입 정의)           [1단계 ✅]
-    Util/                      # 결정적 해시 등                                   [1단계 ✅]
-    Editing/                   # 브러시, 편집 명령, Undo/Redo                      [2단계]
-    Scent/                     # ScentField, 확산·감쇠 시스템                      [3단계]
-    Simulation/                # 고정 틱 실행기, 시스템 파이프라인, 결정적 난수     [4단계]
-    Serialization/             # 맵/실험 저장·불러오기                             [5단계]
-  AntSim.Godot/                # Godot 4 .NET 프로젝트 (렌더링·입력·UI만 담당)       [6단계]
-tests/
-  AntSim.Core.Tests/           # xUnit, Godot 없이 실행
-tools/
-  AntSim.Benchmarks/           # 기준 성능 측정 (Stopwatch 기반, 의존성 없음)
-docs/                          # 설계, 미정 규칙, 로드맵, 벤치마크 기록
+AntSimulator.sln                 # 전체 (코어 + 테스트 + 벤치마크 + Godot 앱)
+Directory.Build.props            # 공통 빌드 설정 (nullable, 경고=오류, 결정적 빌드)
+src/AntSim.Core/                 # 순수 C# 시뮬레이션 코어 (net8.0, Godot 참조 없음)
+  Worlds/        World, WorldLayer, Chunk, WorldConfig, WorldRules, PassageMap, TileState·열거형
+  Editing/       MapEditor(원자적 편집·Undo/Redo), EditOp, EditorTool, EditorStroke, EditorText
+  Serialization/ MapSerializer(버전 있는 바이너리 형식), MapFormatException
+  Rendering/     ChunkRasterizer, TilePalette (청크 → RGBA 픽셀, Godot 비의존)
+  Util/          Fnv1a64(결정적 해시), GridLine(브레젠험)
+  Scent/         [Phase 2] ScentRegistry, ScentField, ScentSystem
+  Simulation/    [Phase 3] SimulationHost(계산 스레드), 명령 큐, 고정 틱
+godot/                           # Godot 4 .NET 프로젝트 (렌더링·입력·UI만)
+  project.godot, Main.tscn, AntSim.App.csproj, AntSim.App.sln
+  Scripts/ Main(조립 루트·입력), MapView(청크 텍스처), EditorCamera, EditorPanel, Main.SmokeTest
+tests/AntSim.Core.Tests/         # xUnit, Godot 없이 실행
+tools/AntSim.Benchmarks/         # 기준 성능 측정
+tools/godot-smoke-test.sh        # Godot 통합 점검 (헤드리스 / xvfb)
 ```
 
-`AntSim.Core`는 Godot 어셈블리를 참조하지 않는다. Godot 프로젝트가 코어를 `ProjectReference`로 참조하는 단방향 의존이다.
-Godot 4.x .NET이 net8.0을 지원하므로 코어도 net8.0을 대상으로 한다.
+의존 방향: `AntSim.App(Godot) → AntSim.Core`. 코어는 Godot을 모른다.
 
 ## 2. 데이터 모델
 
-### 월드 / 레이어 / 청크
+### 타일 (속성별 연속 배열)
 
-| 개념 | 표현 | 비고 |
+| 평면(`TilePlane`) | 타입 | 값 |
 |---|---|---|
-| World | 레이어 2개 + 타입 레지스트리 | 지상(`Surface`), 개미집(`Nest`) |
-| WorldConfig | 너비·높이·청크 크기 (불변) | 청크 크기는 8~256의 2의 거듭제곱(기본 64). 맵 크기는 청크 배수일 필요 없음 (예: 1000×1000 → 16×16 청크, 가장자리 청크는 40칸만 유효) |
-| WorldLayer | 청크 배열 (행 우선) | 좌표 → 청크 = 시프트, 청크 내 위치 = 마스크 |
-| Chunk | `ushort[] tiles`, `ushort[] blocks` (SoA, stride = 청크 크기) | `Version`, `IsDirty`로 변경 추적 |
+| Terrain | byte | 흙 0, 물 1 |
+| Solid | byte | 없음 0, 토양 1, 바위 2 |
+| Food | byte | 먹이 수량 |
+| Larva | byte | 유충 수량 |
 
-- **타일 / 블록 해석 (가정, 확인 필요)**: 타일 = 칸의 바닥 재질, 블록 = 그 칸을 점유하는 물체(없으면 0).
-  두 값은 같은 칸에 독립적으로 저장된다. 이 해석은 `OPEN_QUESTIONS.md` Q1에서 확정 대상이다.
-- 타일/블록 값은 `ushort` 타입 ID(최대 65,536종). 문자열 키 ↔ ID 매핑은 `TypeRegistry`가 담당하며, 등록 순서가 같으면 ID도 같다(재현성).
-- 타입 정의(`TypeDefinition`)는 현재 `Id/Key/DisplayName`만 가진다. 통행 가능·굴착 가능 같은 속성은 게임 규칙이므로 규칙 확정 후 추가한다.
-- 메모리: 1024×1024 기준 레이어당 타일 2MB + 블록 2MB, 2레이어 합계 약 8MB.
+- 청크(64×64)마다 평면별 `byte[4096]`을 둔다(SoA). 1024² 맵은 레이어당 4MB, 2레이어 8MB.
+- 맵 크기는 청크의 배수일 필요가 없다(1000×1000 → 16×16 청크, 가장자리 청크는 일부만 유효).
+- 불변 조건(`WorldRules.Validate`)
+  - 고체 블록이 있으면 먹이·유충 = 0 (독점)
+  - 먹이 + 유충 ≤ `MaxQuantityPerTile`(기본 10, 맵 파일에 저장)
+  - 열거형 값 범위
+- `TileState`는 한 타일의 네 속성을 묶은 값 타입으로, 검증·Undo 기록·정보 조회에 쓴다. 저장소는 SoA 그대로다.
 
-**왜 타일/블록은 청크별 배열인가?** 렌더러 업로드, 편집 Undo 스냅샷, 저장, 변경 감지가 모두 청크 단위로 이뤄진다. 청크(64×64 ushort = 8KB)는 L1 캐시에 들어간다.
+### 통로 (`PassageMap`)
 
-### 냄새 (3단계 설계안)
+- 타일 속성과 분리된 연결 데이터. 좌표 (x, y)에 통로가 있으면 지상(x, y) ↔ 개미집(x, y)이 양방향으로 이어진다.
+- 좌표당 1비트 비트셋(1024² 기준 128KB). 조회 O(1), 순회는 선형 인덱스 오름차순(결정적).
+- 통로가 바뀌면 두 레이어의 해당 청크를 더티로 표시한다(렌더링 갱신).
 
-```
-ScentField (레이어 하나 × 냄새 종류 하나)
-  float[] current   // Width*Height, 행 우선, 레이어 전체 연속 배열
-  float[] next      // 이중 버퍼 (확산 계산용)
-  ulong   activeChunkMask[]  // 청크별 "0이 아닌 값 존재" 플래그 → 빈 영역 건너뛰기
-ScentRegistry: 냄새 종류 정의 (키, 확산 계수, 감쇠 계수 …) — 값은 미정 규칙
-```
-
-- 요구사항대로 **냄새 종류별로 레이어 전체를 하나의 연속 배열**로 둔다. 확산 스텐실이 청크 경계 처리 없이 행 단위 SIMD로 돌 수 있다.
-- 청크는 냄새에서 "활성 영역" 단위로만 쓴다.
-- 이중 버퍼: 각 칸의 다음 값은 이전 버퍼만 읽어 계산 → 행 묶음 병렬화해도 결과가 결정적.
-- 기본 수치 모델(후보): 명시적 4-이웃 확산 + 지수 감쇠. `c' = c + D·(Σ이웃 − 4c) − k·c`, 안정 조건 `D ≤ 0.25`.
-- 메모리: 1024² float = 4MB × 이중버퍼 2 × 종류 K × 레이어 2 → K=4일 때 64MB.
-
-## 3. 주요 클래스와 인터페이스
-
-구현됨(1단계):
-
-```csharp
-sealed class WorldConfig   { Width, Height, ChunkSize, ChunkShift, ChunkMask, ChunksX, ChunksY, InBounds(), ToChunk() }
-sealed class World         { Surface, Nest, GetLayer(LayerId), TileTypes, BlockTypes, ComputeContentHash() }
-sealed class WorldLayer    { GetTile/SetTile, GetBlock/SetBlock, GetChunk, Chunks, CollectDirtyChunks(), ComputeContentHash() }
-sealed class Chunk         { Coord, Origin, ValidWidth/Height, Version, IsDirty, Tiles, Blocks, TileRow(), BlockRow() }
-sealed class TypeRegistry  { Register(key, name), Contains(id), Get(id), GetId(key), CreateWithEmpty() }
-struct Fnv1a64             // 결정적 해시
-```
-
-계획(이후 단계):
-
-```csharp
-// 2단계 편집
-interface IBrush { void Enumerate(TileCoord center, Action<int,int> visit); }   // 점, 사각형, 원, 선
-sealed class EditCommand   // 청크별 변경 전/후 diff를 기록 → Undo/Redo
-sealed class EditHistory   { Apply(cmd), Undo(), Redo() }
-
-// 3단계 냄새
-sealed class ScentField    { Span<float> Current; void Deposit(x,y,amount); }
-sealed class ScentSystem : ISimulationSystem   // 확산·감쇠
-
-// 4단계 시뮬레이션
-interface ISimulationSystem { void Tick(in TickContext ctx); }
-sealed class SimulationRunner { Accumulate(realDelta) → 고정 dt로 N틱 실행; TickIndex; Seed }
-struct DeterministicRandom   // PCG/xoshiro, 시드 고정, System.Random 대신 사용
-```
-
-## 4. 시스템 간 데이터 흐름
+### 냄새 (Phase 2 설계)
 
 ```
- [Godot 입력/UI] ──편집 명령──▶ EditHistory ──▶ World(타일/블록) ──Dirty 청크──┐
-                                                    │                           ▼
-                                                    │ (읽기)              [Godot 렌더러]
- [SimulationRunner] 고정 dt 틱 ─▶ ScentSystem ──▶ ScentField ──표시용 복사──▶ (청크 텍스처 갱신)
-        ▲                                                                        
- Godot _Process(delta) → runner.Accumulate(delta)   ※ 시뮬레이션은 렌더 프레임과 독립
+ScentDefinition { Key, SourcePlane(Food|Larva), EmissionPerUnit, DecayRate, Diffusion, PassageDiffusion }
+ScentField (냄새 종류 × 레이어) { float[] Current, float[] Next }   // 레이어 전체 연속 배열(W*H)
+ScentSettings { TickSeconds = 0.1, 종류별 계수 … }                    // 실행 중 변경 가능, 검증 후 적용
 ```
 
-- 쓰기 주체: 편집기(틱 사이에만 적용)와 시뮬레이션 시스템. 렌더러는 읽기만 한다.
-- 편집 명령은 큐에 쌓였다가 **틱 경계에서** 적용 → 재현 시 "틱 N에 명령 X" 로그로 동일 실행 재생 가능.
-- 렌더러는 `CollectDirtyChunks`로 바뀐 청크만 텍스처에 업로드한다. 타일마다 Node를 만들지 않는다.
-- 냄새 오버레이는 선택된 종류 하나만, 필요하면 다운샘플해 업로드한다.
+- 냄새 종류 추가 = `ScentDefinition` 등록 하나(필드·시스템 코드 변경 없음).
+- 틱 순서: **확산 → 감쇠 → 발생**. 확산은 Current만 읽고 Next에 쓴 뒤 교환(이중 버퍼).
+- 고체 칸은 농도 0이며 이웃과 플럭스를 교환하지 않는다. 맵 경계 밖 이웃도 플럭스 0(밀폐 경계 → 감쇠·발생이 없으면 총량 보존).
+- 레이어 간 이동은 통로 좌표에서만 일어난다.
+- 냄새 배열은 청크와 무관한 레이어 전체 배열이므로 청크 경계에서도 같은 공식이 적용된다(연속성).
+- 비음수 보장 조건: `(4·D + Dp)·dt ≤ 1`, `k·dt ≤ 1`. 설정 적용 시 검증한다. 초기값(0.6, 0.6, 0.025, dt 0.1)은 이웃당 교환율 해석 기준 0.30, 0.0025로 만족한다(해석은 Q1 확인 필요).
 
-## 5. 예상 성능 병목
+## 3. 주요 클래스
 
-측정값은 `BENCHMARKS.md` 참고 (1단계 기준선 측정 완료).
+| 클래스 | 책임 |
+|---|---|
+| `WorldConfig` | 크기·청크 분할(불변), 좌표 변환 |
+| `World` | 레이어 2개 + `PassageMap` + `WorldRules`, 콘텐츠 해시 |
+| `WorldLayer` | 청크 격자, 타일 조회/검증된 쓰기, 더티 청크 수집, 행 복사 |
+| `Chunk` | 평면별 배열, `Version`/`IsDirty` |
+| `MapEditor` | 편집의 단일 진입점. 연산 배치를 임시 상태에 적용해 전부 검증한 뒤 일괄 반영(원자성), Undo/Redo, 스트로크 묶음 |
+| `EditOp` | 데이터로만 된 편집 명령(이후 계산 스레드 명령 큐로 그대로 전달 가능) |
+| `EditorStroke` | 클릭·드래그 경로 보간, 스트로크 내 타일당 1회 적용, 실패 집계 |
+| `MapSerializer` | 버전 있는 바이너리 형식 저장/불러오기, 손상·규칙 위반 거부 |
+| `ChunkRasterizer` | 청크 → RGBA8 픽셀(Godot `Image` 형식과 동일) |
+| `MapView` (Godot) | 청크별 `ImageTexture`, 더티 청크만 갱신, 화면↔타일 좌표 변환 |
+| `Main` (Godot) | 입력 → 편집 명령, 단축키, 파일 대화상자 |
 
-| 영역 | 예상 비용 | 대응 방안 (측정 후 결정) |
-|---|---|---|
-| 냄새 확산 | 1M칸 × K종 × 2레이어 / 틱. K=4면 틱당 8M칸 갱신, 스칼라 ~1ns/칸이면 ~8ms | 활성 청크만 계산, `System.Numerics.Vector` SIMD, 행 묶음 병렬, 틱당 확산 횟수 조절 |
-| 칸 단위 API 호출 | `SetTile` 1회 ~22ns (경계·ID 검사 포함) | 편집기 대량 채우기는 청크 단위 span 연산으로 (2단계) |
-| 렌더 업로드 | 전체 맵 1M픽셀 매 프레임 업로드는 낭비 | 더티 청크 텍스처만 갱신, 냄새는 낮은 빈도/해상도 |
-| 메모리 | 냄새 종류 수에 비례 (종류당 16MB, 2레이어·이중버퍼) | 종류 수 확정 후 판단, 필요 시 half/ushort 양자화 |
-| 결정성 vs 병렬화 | 부동소수점 합산 순서가 바뀌면 결과가 달라짐 | 칸별 계산은 순서 무관한 스텐실만 병렬화, 리덕션은 고정 순서 |
-| Undo 메모리 | 큰 브러시 = 많은 칸 기록 | 청크 단위 diff, 이력 상한 |
+## 4. 데이터 흐름
 
-## 6. 재현성 원칙
+```
+Phase 1 (현재: 편집만, 단일 스레드)
+  입력 이벤트 ─▶ Main ─EditorStroke/EditOp─▶ MapEditor ─검증·적용─▶ World
+                                                                   │ 더티 청크
+  MapView._Process ◀────────────── CollectDirtyChunks ◀───────────┘ → ChunkRasterizer → ImageTexture.Update
 
-- 고정 dt 틱, 틱 번호 기반 진행. 실시간 경과 시간은 "몇 틱을 돌릴지"에만 영향.
-- 난수는 시드 고정된 자체 PRNG만 사용 (`System.Random`, `Guid`, `DateTime` 금지).
-- 순회 순서는 항상 배열 순서(행 우선). `Dictionary` 순회 결과에 의존하지 않는다.
-- `World.ComputeContentHash()`로 상태를 비교한다. 해시는 월드 좌표 순서로 계산하므로 청크 크기와 무관하다.
+Phase 3 (계획: 시뮬레이션 스레드 분리)
+  Godot 메인 스레드                         계산 스레드 (SimulationHost)
+  입력 → EditOp ──(명령 큐)──────────────▶  틱 경계에서 MapEditor.Apply
+  재생/정지/단일 틱 ──(제어 큐)──────────▶  고정 dt 0.1s 틱: 확산 → 감쇠 → 발생
+  히트맵 텍스처 ◀──(완료된 스냅샷 교환)───  틱 후 표시용 버퍼 게시
+```
+
+- Phase 3부터 월드와 냄새 필드는 계산 스레드만 쓴다. 메인 스레드는 명령을 넣고, 게시된 스냅샷만 읽는다.
+- 편집 명령이 데이터(`EditOp`)라 큐로 넘기기 쉽고, "틱 N에 명령 X" 기록으로 실험을 재생할 수 있다.
+
+## 5. 재현성 원칙
+
+- 고정 dt 틱, 틱 번호 기반 진행. 실시간 경과는 "몇 틱을 돌릴지"에만 영향.
+- 순회 순서는 항상 배열 순서(행 우선·인덱스 오름차순). `Dictionary` 순회 결과에 의존하지 않는다.
+- 난수가 필요해지면 시드 고정 자체 PRNG만 사용(`System.Random` 금지).
+- `World.ComputeContentHash()`로 상태를 비교한다. 월드 좌표 순서로 계산하므로 청크 크기와 무관하다.

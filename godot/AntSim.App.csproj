@@ -1,0 +1,14 @@
+<Project Sdk="Godot.NET.Sdk/4.4.1">
+
+  <!-- Godot 프론트엔드: 렌더링·입력·UI만 담당한다. 시뮬레이션/편집 로직은 AntSim.Core에 있다. -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <RootNamespace>AntSim.App</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\src\AntSim.Core\AntSim.Core.csproj" />
+  </ItemGroup>
+
+</Project>

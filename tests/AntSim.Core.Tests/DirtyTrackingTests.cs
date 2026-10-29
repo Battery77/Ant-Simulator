@@ -4,6 +4,8 @@ namespace AntSim.Core.Tests;
 
 public class DirtyTrackingTests
 {
+    private static readonly TileState Water = new(Terrain.Water, SolidBlock.None, 0, 0);
+
     [Fact]
     public void NewWorld_HasNoDirtyChunks()
     {
@@ -15,7 +17,7 @@ public class DirtyTrackingTests
     public void Change_MarksOnlyContainingChunk_AndCollectClearsIt()
     {
         var layer = TestWorlds.Create(128, 128, chunkSize: 32).Surface;
-        Assert.True(layer.SetTile(40, 70, 1));
+        layer.TrySetState(40, 70, Water);
 
         var dirty = new List<Chunk>();
         Assert.Equal(1, layer.CollectDirtyChunks(dirty));
@@ -31,9 +33,7 @@ public class DirtyTrackingTests
         var layer = TestWorlds.Create(64, 64).Surface;
         var chunk = layer.GetChunk(new ChunkCoord(0, 0));
         uint before = chunk.Version;
-
-        Assert.False(layer.SetTile(1, 1, 0));
-        Assert.False(layer.SetBlock(1, 1, 0));
+        layer.TrySetState(1, 1, new TileState(Terrain.Dirt, SolidBlock.None, 0, 0));
         Assert.Equal(before, chunk.Version);
         Assert.False(chunk.IsDirty);
     }
@@ -43,19 +43,19 @@ public class DirtyTrackingTests
     {
         var layer = TestWorlds.Create(64, 64).Surface;
         var chunk = layer.GetChunk(new ChunkCoord(0, 0));
-        layer.SetTile(0, 0, 1);
-        layer.SetTile(0, 0, 2);
-        layer.SetBlock(0, 0, 1);
-        Assert.Equal(3u, chunk.Version);
+        layer.TrySetState(0, 0, Water);
+        layer.TrySetState(0, 0, Water with { Food = 1 });
+        layer.TrySetState(0, 0, Water with { Food = 1 });
+        Assert.Equal(2u, chunk.Version);
     }
 
     [Fact]
     public void DirtyChunks_AreCollectedInRowMajorOrder()
     {
         var layer = TestWorlds.Create(128, 128, chunkSize: 32).Surface;
-        layer.SetTile(100, 100, 1); // (3,3)
-        layer.SetTile(0, 100, 1);   // (0,3)
-        layer.SetTile(100, 0, 1);   // (3,0)
+        layer.TrySetState(100, 100, Water); // (3,3)
+        layer.TrySetState(0, 100, Water);   // (0,3)
+        layer.TrySetState(100, 0, Water);   // (3,0)
 
         var dirty = new List<Chunk>();
         layer.CollectDirtyChunks(dirty);
@@ -68,7 +68,7 @@ public class DirtyTrackingTests
     public void Layers_TrackDirtinessSeparately()
     {
         var world = TestWorlds.Create(64, 64);
-        world.Nest.SetTile(0, 0, 1);
+        world.Nest.TrySetState(0, 0, Water);
         Assert.Equal(0, world.Surface.CollectDirtyChunks(new List<Chunk>()));
         Assert.Equal(1, world.Nest.CollectDirtyChunks(new List<Chunk>()));
     }
