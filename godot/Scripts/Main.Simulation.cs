@@ -429,9 +429,10 @@ public partial class Main
             _snapshot = null;
             _heatmap.HideHeatmap();
             _antView.Clear();
+            // 보간 기준은 이전 세대 프레임을 버릴 때만 지운다. 결과보다 새 세대 스냅샷이 먼저 도착해 이미 표시 중이면 그 기준을 유지한다.
+            _frameTick = _frameResetCount = -1;
         }
         ClearAntSelection();
-        _frameTick = _frameResetCount = -1;
         _heatmapDirty = true;
         return result;
     }
