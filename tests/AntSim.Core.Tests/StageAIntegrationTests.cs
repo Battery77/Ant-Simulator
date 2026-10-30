@@ -334,3 +334,20 @@ public class StageAResetIntegrationTests
         }
     }
 }
+
+/// <summary>개미 수가 많을 때의 성능 특성: 틱마다 개미 수에 비례하는 관리 힙 할당이 없어야 한다(GC 압력).</summary>
+public class StageAAllocationTests
+{
+    [Fact]
+    public void AntTick_DoesNotAllocatePerAnt()
+    {
+        var session = new SimulationSession(SimulationSessionTests.SampleWorld(), ScentSettings.Default,
+            AntSettings.Default with { InitialCount = 5000, Seed = 3 });
+        var system = new AntSystem();
+        for (int i = 0; i < 20; i++) system.Tick(session.Ants, session.World, session.AntSettings, 0.1f); // JIT·지상 확산
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < 10; i++) system.Tick(session.Ants, session.World, session.AntSettings, 0.1f);
+        long perTick = (GC.GetAllocatedBytesForCurrentThread() - before) / 10;
+        Assert.True(perTick < 1024, $"개미 5,000마리 1틱 할당 {perTick}바이트(개미 수에 비례하는 할당 의심)");
+    }
+}

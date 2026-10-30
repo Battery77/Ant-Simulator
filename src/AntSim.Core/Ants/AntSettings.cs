@@ -64,11 +64,13 @@ public sealed record AntSettings
 
     public float SpeedFactorFor(int quantity)
     {
+        // 개미마다 매 틱 호출되므로 인터페이스 foreach(열거자 할당)를 쓰지 않는다.
+        var tiers = QuantitySpeedTiers;
         float factor = 1f;
-        foreach (var tier in QuantitySpeedTiers)
+        for (int i = 0; i < tiers.Count; i++)
         {
-            if (quantity < tier.MinQuantity) break;
-            factor = tier.Factor;
+            if (quantity < tiers[i].MinQuantity) break;
+            factor = tiers[i].Factor;
         }
         return factor;
     }
