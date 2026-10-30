@@ -158,6 +158,7 @@ public partial class Main
         check(_scentSettings.TickSeconds == 0.05, "안정 틱 설정 적용");
 
         await SmokeAuditFixes(check);
+        await SmokeStageAResetIntegration(check);
 
         // F02: 저장을 요청한 직후 편집 모드로 나가도(호스트 종료) 저장 요청은 제한 시간 안에 끝나야 한다.
         string exitSavePath = ProjectSettings.GlobalizePath("user://smoke-exit.antexp");
@@ -256,8 +257,60 @@ public partial class Main
         }
 
         if (ScreenshotPath is { } screenshot && HasDisplay) await CaptureAntScreenshots(screenshot);
-        _selectedAntId = -1;
+        ClearAntSelection();
         _simPanel.SelectHeatmap(HeatmapMode.Single, 0);
+    }
+
+    /// <summary>
+    /// 단계 A 통합: 초기화·개미 설정 적용이 화면 월드·세대·선택·보간을 새 세대로 맞추고, 이전 호스트의 늦은 결과가 새 호스트 화면을 덮어쓰지 않는다.
+    /// </summary>
+    private async Task SmokeStageAResetIntegration(Action<bool, string> check)
+    {
+        var host = _host!;
+        await WaitUntil(() => _snapshot is not null, "통합 시험 시작 스냅샷");
+
+        // 개미를 선택한 뒤 초기화하면 선택이 풀리고(같은 ID의 다른 개미를 가리키지 않음), 화면 월드·세대가 새 결과로 바뀐다.
+        var f = _snapshot!.Ants;
+        int pick = f.Count > 0 ? 0 : -1;
+        if (pick >= 0) SetLayer((LayerId)f.Layer[pick]);
+        check(pick >= 0 && TrySelectAnt(new Vector2(f.X[pick], f.Y[pick])) && DescribeSelectedAnt() is not null, "초기화 전 개미 선택");
+        long generation = _minResetCount;
+        await host.RunExclusiveAsync(s => { new MapEditor(s.World).Apply(EditOp.SetTerrain(LayerId.Surface, 9, 9, Terrain.Water)); s.Step(20); return true; });
+        await ResetSimulation();
+        check(_selectedAntId == -1 && DescribeSelectedAnt() is null, "초기화 후 개미 선택 해제");
+        check(_minResetCount == generation + 1, $"초기화 세대 증가 ({_minResetCount})");
+        ulong computed = await host.RunExclusiveAsync(s => s.World.ComputeContentHash());
+        check(_simWorld!.ComputeContentHash() == computed && ReferenceEquals(_view.DisplayedWorld, _simWorld), "초기화 후 화면 월드 = 계산 월드");
+        await WaitUntil(() => _snapshot is { } s && s.ResetCount == _minResetCount, "새 세대 스냅샷");
+        check(_snapshot!.Tick == 0 && _frameResetCount == _minResetCount, "보간 기준이 새 세대의 틱 0");
+
+        // 개미 설정 적용(초기화 경로)도 같은 계약
+        await host.RunExclusiveAsync(s => { new MapEditor(s.World).Apply(EditOp.SetTerrain(LayerId.Surface, 9, 9, Terrain.Water)); return true; });
+        await ApplyAntSettings(_antSettings with { InitialCount = 77, Seed = 11 });
+        computed = await host.RunExclusiveAsync(s => s.World.ComputeContentHash());
+        check(_simWorld!.ComputeContentHash() == computed && _simWorld.Surface.GetState(9, 9).Terrain == Terrain.Dirt,
+            "개미 설정 적용 후 화면 월드 = 계산 월드(시작 월드)");
+        check(_minResetCount == generation + 2, "개미 설정 적용도 초기화 세대를 올림");
+        await WaitUntil(() => _snapshot is { } s && s.ResetCount == _minResetCount && s.Ants.Count == 77, "개미 77마리 새 세대 프레임");
+
+        // 이전 호스트의 늦은 초기화 결과가 새 호스트(불러온 실험)의 화면을 덮어쓰지 않는다.
+        string path = ProjectSettings.GlobalizePath("user://smoke-stage-a.antexp");
+        await host.RunExclusiveAsync(s =>
+        {
+            new MapEditor(s.World).Apply(EditOp.SetTerrain(LayerId.Surface, 9, 9, Terrain.Water));
+            ExperimentSerializer.Save(s, path);
+            return true;
+        });
+        var lateReset = ResetSimulation(); // 이전 호스트에 초기화 요청
+        LoadExperiment(path);              // 곧바로 새 호스트로 교체
+        var finished = await Task.WhenAny(lateReset, Task.Delay(TimeSpan.FromSeconds(10)));
+        check(finished == lateReset, "이전 호스트의 초기화 요청이 끝남");
+        await NextFrame();
+        check(_host != host, "불러오기로 새 호스트");
+        check(_simWorld!.Surface.GetState(9, 9).Terrain == Terrain.Water, "이전 호스트의 초기화 결과가 새 화면 월드를 덮어쓰지 않음");
+        check(_minResetCount == 0, $"새 호스트의 세대 기준 유지 ({_minResetCount})");
+        await WaitUntil(() => _snapshot is { } s && s.Ants.Count == 77, "불러온 실험의 개미 프레임");
+        System.IO.File.Delete(path);
     }
 
     private async Task CheckAntsDrawn(Action<bool, string> check, Rect2 view, string label)
@@ -316,7 +369,7 @@ public partial class Main
                 }
                 if (best >= 0)
                 {
-                    _selectedAntId = f.Id[best];
+                    SelectAnt(f.Id[best], _snapshot.ResetCount);
                     _camera.FitTo(new Rect2(f.X[best] - 14, f.Y[best] - 8, 28, 16));
                     _camera.Position -= new Vector2(4, 0);
                 }

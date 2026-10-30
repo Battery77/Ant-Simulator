@@ -143,7 +143,7 @@ public partial class Main : Node
         if (key.Keycode == Key.Escape)
         {
             _pinnedTile = null;
-            _selectedAntId = -1;
+            ClearAntSelection();
             GetViewport().SetInputAsHandled();
             return;
         }
