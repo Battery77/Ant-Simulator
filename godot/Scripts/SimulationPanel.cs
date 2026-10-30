@@ -1,7 +1,9 @@
 using System.Globalization;
 using AntSim.Core.Ants;
+using AntSim.Core.Editing;
 using AntSim.Core.Rendering;
 using AntSim.Core.Scent;
+using AntSim.Core.Worlds;
 using Godot;
 
 namespace AntSim.App;
@@ -66,6 +68,12 @@ public partial class SimulationPanel : PanelContainer
     public event Action<AntSettings>? AntSettingsApplyRequested;
     public event Action? LoadExperimentRequested;
 
+    /// <summary>보는 레이어 변경 요청(표시만 바뀐다. 시뮬레이션 상태와 무관).</summary>
+    public event Action<LayerId>? LayerChanged;
+
+    private readonly ButtonGroup _layerGroup = new();
+    private readonly Dictionary<LayerId, Button> _layerButtons = new();
+
     public HeatmapOptions Heatmap
     {
         get
@@ -77,6 +85,21 @@ public partial class SimulationPanel : PanelContainer
                 _autoMax.ButtonPressed, (float[])_fixedMax.Clone());
         }
     }
+
+    /// <summary>보는 레이어 버튼 상태를 맞춘다. ButtonPressed 설정은 toggled만 보내고 Pressed(→ LayerChanged)는 보내지 않는다.</summary>
+    public void SetLayer(LayerId layer)
+    {
+        if (_layerButtons.TryGetValue(layer, out var button)) button.ButtonPressed = true;
+    }
+
+    /// <summary>보는 레이어 버튼(스모크 테스트에서 실제 클릭·표시 확인용).</summary>
+    internal Button LayerButton(LayerId layer) => _layerButtons[layer];
+
+    /// <summary>타일·개미 정보 칸의 현재 문구(스모크 테스트용).</summary>
+    internal string InfoText => _info.Text;
+
+    /// <summary>현재 눌린 보는 레이어 버튼.</summary>
+    public LayerId ShownLayer => _layerButtons.FirstOrDefault(p => p.Value.ButtonPressed).Key;
 
     /// <summary>범례 색 막대(종류 → 그라디언트). 단일 모드는 type = -1로 호출된다.</summary>
     public void SetLegendGradientProvider(Func<int, Gradient> provider) => _legendGradient = provider;
@@ -94,6 +117,23 @@ public partial class SimulationPanel : PanelContainer
         root.AddThemeConstantOverride("separation", 6);
         scroll.AddChild(root);
 
+        // 편집 패널과 같은 위치·방식의 레이어 전환(편집 패널은 시뮬레이션 모드에서 숨겨지므로 여기에도 둔다).
+        root.AddChild(Header("보는 레이어 (Tab)"));
+        var layers = new HBoxContainer();
+        root.AddChild(layers);
+        foreach (var layer in new[] { LayerId.Surface, LayerId.Nest })
+        {
+            var button = new Button
+            {
+                Text = EditorText.Name(layer), ToggleMode = true, ButtonGroup = _layerGroup,
+                FocusMode = FocusModeEnum.None, SizeFlagsHorizontal = SizeFlags.ExpandFill,
+            };
+            button.Pressed += () => LayerChanged?.Invoke(layer);
+            layers.AddChild(button);
+            _layerButtons[layer] = button;
+        }
+        _layerButtons[LayerId.Surface].ButtonPressed = true;
+
         root.AddChild(Header("실행 (Space: 재생/일시정지, .: 단일 틱)"));
         var controls = new GridContainer { Columns = 2 };
         root.AddChild(controls);
@@ -108,7 +148,7 @@ public partial class SimulationPanel : PanelContainer
         root.AddChild(_clock);
 
         root.AddChild(Header("개미 (클릭: 선택)"));
-        _antCount = new Label();
+        _antCount = new Label { AutowrapMode = TextServer.AutowrapMode.WordSmart }; // 숫자·레이어가 바뀌어도 패널 폭이 흔들리지 않게
         root.AddChild(_antCount);
         _antInitialCount = AddNumberRow(root, "개체 수", 0, AntSettings.MaxCount, 1);
         _antSeed = AddNumberRow(root, "시드", 0, int.MaxValue, 1);

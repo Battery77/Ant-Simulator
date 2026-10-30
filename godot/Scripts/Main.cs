@@ -198,7 +198,9 @@ public partial class Main : Node
     {
         EndStroke();
         _view.Layer = layer;
+        // 보는 레이어만 바꾼다(표시 상태). 시뮬레이션·개미의 실제 레이어·냄새·호스트는 건드리지 않는다.
         _panel.SetLayer(layer);
+        _simPanel.SetLayer(layer);
         OnSimulationLayerChanged();
     }
 

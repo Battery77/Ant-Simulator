@@ -158,6 +158,7 @@ public partial class Main
         check(_scentSettings.TickSeconds == 0.05, "안정 틱 설정 적용");
 
         await SmokeAuditFixes(check);
+        await SmokeSimulationLayerSwitch(check);
         await SmokeStageAResetIntegration(check);
 
         // F02: 저장을 요청한 직후 편집 모드로 나가도(호스트 종료) 저장 요청은 제한 시간 안에 끝나야 한다.
@@ -259,6 +260,125 @@ public partial class Main
         if (ScreenshotPath is { } screenshot && HasDisplay) await CaptureAntScreenshots(screenshot);
         ClearAntSelection();
         _simPanel.SelectHeatmap(HeatmapMode.Single, 0);
+    }
+
+    /// <summary>
+    /// 시뮬레이션 모드의 보는 레이어 전환(사용자 보고: 시뮬레이션 모드에서 레이어 전환 UI가 보이지 않음).
+    /// 버튼이 보이고 클릭되며, 전환은 표시(지형·개미·히트맵·타일 정보)만 바꾸고 틱·개미·냄새·재생 상태는 바꾸지 않는다.
+    /// 일시정지·재생·단일 틱 모두에서 확인한다.
+    /// </summary>
+    private async Task SmokeSimulationLayerSwitch(Action<bool, string> check)
+    {
+        var host = _host!;
+        foreach (var layer in new[] { LayerId.Surface, LayerId.Nest })
+        {
+            var button = _simPanel.LayerButton(layer);
+            check(button.IsVisibleInTree(), $"시뮬레이션 모드: '{EditorText.Name(layer)}' 레이어 버튼이 보임");
+            if (HasDisplay)
+            {
+                var rect = button.GetGlobalRect();
+                check(GetViewport().GetVisibleRect().Encloses(rect) && rect.Size.X > 20 && rect.Size.Y > 10,
+                    $"'{EditorText.Name(layer)}' 버튼이 화면 안에 있음 ({rect})");
+            }
+        }
+
+        // 두 레이어 모두에 개미가 있는 상태를 만든다.
+        await ApplyAntSettings(_antSettings with { InitialCount = 200, Seed = 5 });
+        await host.RunExclusiveAsync(s => { s.Step(300); return true; });
+        _simPanel.SelectHeatmap(HeatmapMode.Single, 0);
+        await WaitUntil(() => _snapshot is { Tick: 300 }, "레이어 전환 시험용 스냅샷");
+        _pinnedTile = new Vector2I(7, 7); // 통로 중심(두 레이어 모두 열림)
+
+        async Task Press(LayerId layer)
+        {
+            var button = _simPanel.LayerButton(layer);
+            if (HasDisplay)
+            {
+                var at = button.GetGlobalRect().GetCenter();
+                await SendMouse(new InputEventMouseButton { ButtonIndex = MouseButton.Left, Pressed = true }, at);
+                await SendMouse(new InputEventMouseButton { ButtonIndex = MouseButton.Left, Pressed = false }, at);
+            }
+            else
+            {
+                button.EmitSignal(BaseButton.SignalName.Pressed); // 헤드리스는 입력 이벤트가 전달되지 않으므로 버튼 신호로 같은 경로를 탄다
+            }
+            await NextFrame();
+            await NextFrame();
+        }
+
+        async Task CheckShown(LayerId layer, string when)
+        {
+            string name = EditorText.Name(layer);
+            check(_view.Layer == layer, $"[{when}] 보는 레이어 = {name}");
+            check(_simPanel.LayerButton(layer).ButtonPressed && !_simPanel.LayerButton(Other(layer)).ButtonPressed, $"[{when}] {name} 버튼만 눌림");
+            await WaitUntil(() => _snapshot is { } s && s.Layer == layer, $"[{when}] {name} 히트맵 스냅샷");
+            await NextFrame();
+            var frame = _snapshot!.Ants;
+            check(_antView.VisibleCount == frame.CountOn(layer), $"[{when}] {name} 개미만 표시 ({_antView.VisibleCount} = {frame.CountOn(layer)})");
+            check(_simPanel.InfoText.Contains($") {name}"), $"[{when}] 타일 정보가 {name} 기준");
+        }
+
+        static LayerId Other(LayerId layer) => layer == LayerId.Surface ? LayerId.Nest : LayerId.Surface;
+
+        // 일시정지
+        var before = await host.RunExclusiveAsync(s => (s.Tick, Hash: s.ComputeStateHash(), Layers: s.Ants.Layer.ToArray()));
+        await Press(LayerId.Nest);
+        await CheckShown(LayerId.Nest, "일시정지");
+        await Press(LayerId.Surface);
+        await CheckShown(LayerId.Surface, "일시정지");
+        await Press(LayerId.Nest);
+        var after = await host.RunExclusiveAsync(s => (s.Tick, Hash: s.ComputeStateHash(), Layers: s.Ants.Layer.ToArray()));
+        check(after.Tick == before.Tick && after.Hash == before.Hash && after.Layers.SequenceEqual(before.Layers) && !host.IsPlaying,
+            "레이어 전환은 틱·개미 레이어·냄새·재생 상태를 바꾸지 않음");
+        check(_host == host, "레이어 전환이 호스트를 다시 만들지 않음");
+
+        // 보는 레이어에 없는 개미는 선택되지 않는다(개미집을 보면서 지상 개미 위치 클릭).
+        var f = _snapshot!.Ants;
+        for (int i = 0; i < f.Count; i++)
+        {
+            if (f.Layer[i] != (byte)LayerId.Surface) continue;
+            bool nestNearby = false;
+            for (int j = 0; j < f.Count && !nestNearby; j++)
+                nestNearby = f.Layer[j] == (byte)LayerId.Nest && MathF.Abs(f.X[j] - f.X[i]) < 1.5f && MathF.Abs(f.Y[j] - f.Y[i]) < 1.5f;
+            if (nestNearby) continue;
+            check(!TrySelectAnt(new Vector2(f.X[i], f.Y[i])), "개미집을 보는 중에는 지상 개미를 선택하지 않음");
+            break;
+        }
+
+        // 재생 중
+        host.Speed = 10;
+        host.Play();
+        await WaitUntil(() => host.Tick >= after.Tick + 5, "레이어 전환 시험: 재생");
+        await Press(LayerId.Surface);
+        check(host.IsPlaying, "재생 중 레이어 전환 후에도 재생 유지");
+        await CheckShown(LayerId.Surface, "재생 중");
+        long t0 = host.Tick;
+        await WaitUntil(() => host.Tick >= t0 + 3, "전환 후 계속 진행");
+        if (ScreenshotPath is { } shot && HasDisplay)
+        {
+            await SaveScreenshot(shot.Replace(".png", $"-layer-surface-playing.png"));
+            await Press(LayerId.Nest);
+            await SaveScreenshot(shot.Replace(".png", $"-layer-nest-playing-a.png"));
+            await Wait(0.5);
+            await SaveScreenshot(shot.Replace(".png", $"-layer-nest-playing-b.png"));
+        }
+        await Press(LayerId.Nest);
+        await CheckShown(LayerId.Nest, "재생 중");
+        host.Pause();
+
+        // 단일 틱 전후
+        long beforeStep = await host.RunExclusiveAsync(s => s.Tick);
+        await StepOnce();
+        await Press(LayerId.Surface);
+        await CheckShown(LayerId.Surface, "단일 틱 후");
+        check(await host.RunExclusiveAsync(s => s.Tick) == beforeStep + 1, "단일 틱은 정확히 1틱(레이어 전환은 틱을 진행하지 않음)");
+
+        // 초기화·모드 전환 후에도 버튼 = 보는 레이어
+        await Press(LayerId.Nest);
+        await ResetSimulation();
+        check(_view.Layer == LayerId.Nest && _simPanel.LayerButton(LayerId.Nest).ButtonPressed, "초기화 후에도 보는 레이어·버튼 유지");
+        _pinnedTile = null;
+        await Press(LayerId.Surface);
     }
 
     /// <summary>

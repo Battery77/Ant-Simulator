@@ -64,6 +64,7 @@ public partial class Main
             SelectHeatmapOnHost();
         };
         _simPanel.SettingsApplyRequested += settings => _ = ApplySettings(settings);
+        _simPanel.LayerChanged += SetLayer;
         _simPanel.AntSettingsApplyRequested += settings => _ = ApplyAntSettings(settings);
         _simPanel.SaveExperimentRequested += () =>
             ShowFileDialog(FileDialog.FileModeEnum.SaveFile, ExperimentFileFilter, path => _ = SaveExperiment(path));
@@ -109,6 +110,7 @@ public partial class Main
         _modeBar.SetMode(AppMode.Simulation);
         _simPanel.SetSettings(_scentSettings);
         _simPanel.SetAntSettings(_antSettings);
+        _simPanel.SetLayer(_view.Layer); // 편집 모드에서 보던 레이어를 그대로 보여 준다
         _simPanel.SetSettingsMessage("");
         ClearAntSelection();
         _frameTick = _frameResetCount = -1;
@@ -217,7 +219,7 @@ public partial class Main
         if (_selectedAntId >= 0 && _selectedAntResetCount != s.ResetCount) ClearAntSelection();
         _antView.ShowFrame(s.Ants, _view.Layer, alpha, _selectedAntId);
         int surface = s.Ants.CountOn(LayerId.Surface);
-        _simPanel.SetAntCount($"개미 {s.Ants.Count}마리 (지상 {surface} / 개미집 {s.Ants.Count - surface}) · 이 레이어 표시 {_antView.VisibleCount}");
+        _simPanel.SetAntCount($"개미 {s.Ants.Count}마리 (지상 {surface} / 개미집 {s.Ants.Count - surface}) · {EditorText.Name(_view.Layer)}에 표시 {_antView.VisibleCount}");
     }
 
     /// <summary>클릭 위치에서 가장 가까운 개미(현재 레이어, 1타일 이내)를 고른다. 없으면 false.</summary>
