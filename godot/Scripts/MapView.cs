@@ -24,6 +24,9 @@ public partial class MapView : Node2D
 
     public TilePalette Palette { get; set; } = TilePalette.Default;
 
+    /// <summary>지금 그리고 있는 월드(점검용).</summary>
+    public World? DisplayedWorld => _world;
+
     public LayerId Layer
     {
         get => _layer;

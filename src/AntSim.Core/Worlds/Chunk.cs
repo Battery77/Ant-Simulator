@@ -77,6 +77,20 @@ public sealed class Chunk
 
     internal void ClearDirty() => IsDirty = false;
 
+    /// <summary>유효 영역의 한 평면을 같은 값으로 채운다(프리셋 생성용, 검증 없음).</summary>
+    internal void Fill(TilePlane plane, byte value)
+    {
+        for (int ly = 0; ly < ValidHeight; ly++) MutableRow(plane, ly).Fill(value);
+        MarkDirty();
+    }
+
+    /// <summary>같은 설정의 다른 청크 내용을 복사한다(월드 복제용). 더티 상태는 복사하지 않는다.</summary>
+    internal void CopyFrom(Chunk source)
+    {
+        for (int i = 0; i < _planes.Length; i++) source._planes[i].CopyTo(_planes[i], 0);
+        Version = source.Version;
+    }
+
     private bool Write(TilePlane plane, int index, byte value)
     {
         ref byte slot = ref _planes[(int)plane][index];

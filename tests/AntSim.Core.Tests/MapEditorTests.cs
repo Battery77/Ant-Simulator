@@ -29,13 +29,12 @@ public class MapEditorTests
     }
 
     [Fact]
-    public void PlaceSolid_OnTileWithQuantity_IsRejected()
+    public void PlaceSolid_OnTileWithQuantity_RemovesQuantities()
     {
         var editor = NewEditor();
         editor.Apply(EditOp.AdjustQuantity(S, 1, 1, QuantityKind.Larva, 1));
-        var result = editor.Apply(EditOp.PlaceSolid(S, 1, 1, SolidBlock.Soil));
-        Assert.Equal(WorldError.SolidOccupied, result.Error);
-        Assert.Equal(SolidBlock.None, editor.World.Surface.GetSolid(1, 1));
+        Assert.True(editor.Apply(EditOp.PlaceSolid(S, 1, 1, SolidBlock.Soil)).Changed);
+        Assert.Equal(new TileState(Terrain.Dirt, SolidBlock.Soil, 0, 0), editor.World.Surface.GetState(1, 1));
     }
 
     [Fact]

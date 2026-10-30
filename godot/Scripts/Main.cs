@@ -8,6 +8,8 @@ namespace AntSim.App;
 /// <summary>
 /// 조립 루트: 코어 월드·편집기와 Godot 표현 노드(MapView, 카메라, 패널)를 연결하고 입력을 편집 명령으로 바꾼다.
 /// 편집 로직(검증, Undo, 스트로크)은 모두 AntSim.Core에 있다.
+/// 편집 모드에서는 원본 월드(<see cref="_world"/>)를 고치고, 시뮬레이션 모드(Main.Simulation.cs)에서는
+/// 복제된 월드로 계산 스레드에서 실험을 실행한다.
 /// </summary>
 public partial class Main : Node
 {
@@ -22,11 +24,14 @@ public partial class Main : Node
     private EditorStroke? _stroke;
     private Vector2I? _pinnedTile;
     private string? _currentPath;
+    private AppMode _mode = AppMode.Edit;
 
     public override void _Ready()
     {
         _view = new MapView { Name = "MapView" };
         AddChild(_view);
+        _heatmap = new HeatmapView { Name = "Heatmap" };
+        AddChild(_heatmap);
         _camera = new EditorCamera { Name = "Camera" };
         AddChild(_camera);
         _camera.MakeCurrent();
@@ -45,6 +50,17 @@ public partial class Main : Node
         _panel.LoadRequested += ShowLoadDialog;
         _panel.NewMapRequested += (w, h) => NewMap(w, h);
 
+        _simPanel = new SimulationPanel { Name = "SimulationPanel", Visible = false };
+        _simPanel.SetAnchorsAndOffsetsPreset(Control.LayoutPreset.LeftWide);
+        ui.AddChild(_simPanel);
+        ConnectSimulationPanel();
+
+        _modeBar = new ModeBar { Name = "ModeBar" };
+        _modeBar.SetAnchorsAndOffsetsPreset(Control.LayoutPreset.CenterTop);
+        _modeBar.GrowHorizontal = Control.GrowDirection.Both;
+        ui.AddChild(_modeBar);
+        _modeBar.ModeRequested += SetMode;
+
         NewMap(1024, 1024);
         if (IsSmokeTest) RunSmokeTest();
     }
@@ -57,14 +73,32 @@ public partial class Main : Node
         bool inside = _view.TryGetTileUnderMouse(out var tile);
         _view.SetHover(inside ? tile : null);
         var shown = _pinnedTile ?? (inside ? tile : null);
+
+        if (_mode == AppMode.Simulation)
+        {
+            ProcessSimulation(shown);
+            return;
+        }
         _panel.SetInfo(shown is { } t ? EditorText.DescribeTile(_world, _view.Layer, t.X, t.Y) : "");
         _panel.SetHistoryState(_editor.CanUndo, _editor.CanRedo);
     }
+
+    public override void _ExitTree() => StopSimulation();
 
     public override void _UnhandledInput(InputEvent @event)
     {
         switch (@event)
         {
+            case InputEventMouseButton { ButtonIndex: MouseButton.Left } button when _mode == AppMode.Simulation:
+                // 시뮬레이션 모드에서는 편집하지 않고 타일 정보만 고정한다.
+                if (button.Pressed)
+                {
+                    var target = _view.ScreenToTile(button.Position);
+                    _pinnedTile = CurrentWorld.Config.InBounds(target.X, target.Y) ? target : null;
+                }
+                GetViewport().SetInputAsHandled();
+                break;
+
             case InputEventMouseButton { ButtonIndex: MouseButton.Left } button:
                 if (button.Pressed) BeginStroke(_view.ScreenToTile(button.Position));
                 else EndStroke();
@@ -94,6 +128,25 @@ public partial class Main : Node
     private void HandleShortcut(InputEventKey key)
     {
         bool ctrl = key.CtrlPressed || key.MetaPressed;
+        if (key.Keycode == Key.Tab)
+        {
+            var next = _view.Layer == LayerId.Surface ? LayerId.Nest : LayerId.Surface;
+            SetLayer(next);
+            GetViewport().SetInputAsHandled();
+            return;
+        }
+        if (key.Keycode == Key.Escape)
+        {
+            _pinnedTile = null;
+            GetViewport().SetInputAsHandled();
+            return;
+        }
+        if (_mode == AppMode.Simulation)
+        {
+            if (HandleSimulationShortcut(key)) GetViewport().SetInputAsHandled();
+            return;
+        }
+
         switch (key.Keycode)
         {
             case Key.Z when ctrl && key.ShiftPressed:
@@ -106,14 +159,6 @@ public partial class Main : Node
             case Key.S when ctrl:
                 if (_currentPath is null) ShowSaveDialog();
                 else SaveTo(_currentPath);
-                break;
-            case Key.Tab:
-                var next = _view.Layer == LayerId.Surface ? LayerId.Nest : LayerId.Surface;
-                SetLayer(next);
-                _panel.SetLayer(next);
-                break;
-            case Key.Escape:
-                _pinnedTile = null;
                 break;
             default:
                 return;
@@ -147,6 +192,8 @@ public partial class Main : Node
     {
         EndStroke();
         _view.Layer = layer;
+        _panel.SetLayer(layer);
+        OnSimulationLayerChanged();
     }
 
     private void Undo()
@@ -165,7 +212,7 @@ public partial class Main : Node
     {
         try
         {
-            SetWorld(new World(new WorldConfig(width, height)), null);
+            SetWorld(WorldPresets.StandardNest(new WorldConfig(width, height)), null);
             _panel.SetStatus($"새 맵 {width}×{height}");
         }
         catch (ArgumentException e)
@@ -185,18 +232,18 @@ public partial class Main : Node
         _camera.FitTo(new Rect2(0, 0, world.Config.Width, world.Config.Height));
     }
 
-    private void ShowSaveDialog() => ShowFileDialog(FileDialog.FileModeEnum.SaveFile, SaveTo);
+    private void ShowSaveDialog() => ShowFileDialog(FileDialog.FileModeEnum.SaveFile, MapFileFilter, SaveTo);
 
-    private void ShowLoadDialog() => ShowFileDialog(FileDialog.FileModeEnum.OpenFile, LoadFrom);
+    private void ShowLoadDialog() => ShowFileDialog(FileDialog.FileModeEnum.OpenFile, MapFileFilter, LoadFrom);
 
-    private void ShowFileDialog(FileDialog.FileModeEnum mode, Action<string> onSelected)
+    private void ShowFileDialog(FileDialog.FileModeEnum mode, string filter, Action<string> onSelected)
     {
         EndStroke();
         var dialog = new FileDialog
         {
             FileMode = mode,
             Access = FileDialog.AccessEnum.Filesystem,
-            Filters = new[] { MapFileFilter },
+            Filters = new[] { filter },
             UseNativeDialog = true,
         };
         dialog.FileSelected += path =>

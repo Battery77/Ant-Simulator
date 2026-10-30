@@ -47,6 +47,8 @@ public static class EditorText
         WorldError.SolidOccupied => "고체 블록은 다른 블록과 공존할 수 없습니다",
         WorldError.QuantityLimitExceeded => "타일의 먹이·유충 합계가 상한을 넘습니다",
         WorldError.NegativeQuantity => "수량은 0보다 작아질 수 없습니다",
+        WorldError.PassageBlockedBySolid => "지상 타일에 고체 블록이 있어 통로를 만들 수 없습니다",
+        WorldError.PassageAreaOutOfBounds => "맵 가장자리라 개미집 3×3 굴착 공간이 들어가지 않습니다",
         _ => error.ToString(),
     };
 

@@ -12,6 +12,9 @@ public sealed class MapEditor
 {
     public const int DefaultHistoryCapacity = 256;
 
+    /// <summary>통로 생성 시 개미집에서 굴착하는 영역의 반경(1 → 3×3).</summary>
+    public const int PassageDigRadius = 1;
+
     private readonly EditHistory _history;
     private readonly List<StagedTile> _stagedTiles = new();
     private readonly Dictionary<long, int> _stagedTileIndex = new();
@@ -20,10 +23,13 @@ public sealed class MapEditor
     private readonly EditOp[] _single = new EditOp[1];
     private EditRecord? _stroke;
 
-    public MapEditor(World world, int historyCapacity = DefaultHistoryCapacity)
+    /// <summary>Undo 기록의 기본 메모리 상한(추정치). 타일 변경 1건 ≈ 24바이트 → 약 280만 건.</summary>
+    public const long DefaultHistoryMemoryLimitBytes = 64L * 1024 * 1024;
+
+    public MapEditor(World world, int historyCapacity = DefaultHistoryCapacity, long historyMemoryLimitBytes = DefaultHistoryMemoryLimitBytes)
     {
         World = world ?? throw new ArgumentNullException(nameof(world));
-        _history = new EditHistory(historyCapacity);
+        _history = new EditHistory(historyCapacity, historyMemoryLimitBytes);
     }
 
     public World World { get; }
@@ -33,6 +39,9 @@ public sealed class MapEditor
     public bool CanRedo => !InStroke && _history.RedoCount > 0;
     public int UndoCount => _history.UndoCount;
     public int RedoCount => _history.RedoCount;
+
+    /// <summary>Undo/Redo 기록의 추정 메모리 사용량(바이트).</summary>
+    public long HistoryEstimatedBytes => _history.EstimatedBytes;
 
     /// <summary>단일 연산을 적용한다.</summary>
     public EditResult Apply(in EditOp op)
@@ -103,7 +112,7 @@ public sealed class MapEditor
     {
         var stroke = _stroke ?? throw new InvalidOperationException("진행 중인 스트로크가 없습니다.");
         _stroke = null;
-        stroke.Compact();
+        stroke.Seal();
         if (stroke.IsEmpty) return false;
         _history.Push(stroke);
         return true;
@@ -142,35 +151,81 @@ public sealed class MapEditor
     {
         if (!World.Config.InBounds(op.X, op.Y)) return WorldError.OutOfBounds;
 
-        if (op.IsPassageOp)
+        switch (op.Kind)
         {
-            long pkey = ((long)op.Y << 32) | (uint)op.X;
-            if (!_stagedPassageIndex.TryGetValue(pkey, out int pi))
-            {
-                bool before = World.Passages.Contains(op.X, op.Y);
-                pi = _stagedPassages.Count;
-                _stagedPassageIndex.Add(pkey, pi);
-                _stagedPassages.Add(new StagedPassage(op.X, op.Y, before, before));
-            }
-            _stagedPassages[pi] = _stagedPassages[pi] with { After = op.Kind == EditOpKind.AddPassage };
-            return WorldError.None;
+            case EditOpKind.AddPassage:
+                return StageAddPassage(op.X, op.Y, opIndex);
+            case EditOpKind.RemovePassage:
+                // 연결만 끊는다. 굴착된 공간은 그대로 남는다.
+                StagePassage(op.X, op.Y, present: false);
+                return WorldError.None;
         }
 
         if ((uint)op.Layer >= World.LayerCount) return WorldError.InvalidLayer;
-        long key = ((long)op.Layer << 48) | ((long)(uint)op.Y << 24) | (uint)op.X;
-        if (!_stagedTileIndex.TryGetValue(key, out int index))
-        {
-            var before = World.GetLayer(op.Layer).GetState(op.X, op.Y);
-            index = _stagedTiles.Count;
-            _stagedTileIndex.Add(key, index);
-            _stagedTiles.Add(new StagedTile(op.Layer, op.X, op.Y, before, before, 0));
-        }
-
-        var current = _stagedTiles[index].After;
-        var error = Transform(op, current, out var next);
+        int index = StagedTileIndex(op.Layer, op.X, op.Y);
+        var error = Transform(op, _stagedTiles[index].After, out var next);
         if (error != WorldError.None) return error;
         _stagedTiles[index] = _stagedTiles[index] with { After = next, OpIndex = opIndex };
         return WorldError.None;
+    }
+
+    /// <summary>
+    /// 통로 생성(굴착 포함)을 스테이징한다.
+    /// 1) 개미집 3×3 영역이 맵 안에 완전히 들어가야 함 2) 지상 중심에 고체가 없어야 함
+    /// 3) 지상 중심이 물이면 흙으로 4) 개미집 3×3의 고체 제거 + 흙 지형(수량 블록은 유지) 5) 통로 연결.
+    /// </summary>
+    private WorldError StageAddPassage(int x, int y, int opIndex)
+    {
+        var config = World.Config;
+        if (x < PassageDigRadius || y < PassageDigRadius ||
+            x + PassageDigRadius >= config.Width || y + PassageDigRadius >= config.Height)
+            return WorldError.PassageAreaOutOfBounds;
+
+        int surface = StagedTileIndex(LayerId.Surface, x, y);
+        var center = _stagedTiles[surface].After;
+        if (center.HasSolid) return WorldError.PassageBlockedBySolid;
+        _stagedTiles[surface] = _stagedTiles[surface] with { After = center with { Terrain = Terrain.Dirt }, OpIndex = opIndex };
+
+        for (int dy = -PassageDigRadius; dy <= PassageDigRadius; dy++)
+        for (int dx = -PassageDigRadius; dx <= PassageDigRadius; dx++)
+        {
+            int nest = StagedTileIndex(LayerId.Nest, x + dx, y + dy);
+            var state = _stagedTiles[nest].After;
+            _stagedTiles[nest] = _stagedTiles[nest] with
+            {
+                After = state with { Terrain = Terrain.Dirt, Solid = SolidBlock.None },
+                OpIndex = opIndex,
+            };
+        }
+
+        StagePassage(x, y, present: true);
+        return WorldError.None;
+    }
+
+    private void StagePassage(int x, int y, bool present)
+    {
+        long key = ((long)y << 32) | (uint)x;
+        if (!_stagedPassageIndex.TryGetValue(key, out int index))
+        {
+            bool before = World.Passages.Contains(x, y);
+            index = _stagedPassages.Count;
+            _stagedPassageIndex.Add(key, index);
+            _stagedPassages.Add(new StagedPassage(x, y, before, before));
+        }
+        _stagedPassages[index] = _stagedPassages[index] with { After = present };
+    }
+
+    private int StagedTileIndex(LayerId layer, int x, int y)
+    {
+        long key = ((long)layer << 48) | ((long)(uint)y << 24) | (uint)x;
+        if (!_stagedTileIndex.TryGetValue(key, out int index))
+        {
+            var before = World.GetLayer(layer).GetState(x, y);
+            index = _stagedTiles.Count;
+            _stagedTileIndex.Add(key, index);
+            _stagedTiles.Add(new StagedTile(layer, x, y, before, before, 0));
+        }
+        return index;
     }
 
     private WorldError Transform(in EditOp op, in TileState current, out TileState next)
@@ -185,9 +240,10 @@ public sealed class MapEditor
                 return WorldError.None;
 
             case EditOpKind.PlaceSolid:
+                // 고체 블록은 타일을 독점하므로 기존 수량 블록을 제거하고, 물 지형은 흙으로 바꾼다.
+                // 기존 고체 블록은 새 블록으로 교체된다.
                 if (op.Solid == SolidBlock.None || !TileEnums.IsDefined(op.Solid)) return WorldError.InvalidSolid;
-                if (current.TotalQuantity > 0) return WorldError.SolidOccupied;
-                next = current with { Solid = op.Solid };
+                next = current with { Terrain = Terrain.Dirt, Solid = op.Solid, Food = 0, Larva = 0 };
                 return WorldError.None;
 
             case EditOpKind.RemoveSolid:

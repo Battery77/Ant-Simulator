@@ -16,4 +16,8 @@ public enum WorldError : byte
     QuantityLimitExceeded,
     /// <summary>수량이 0 미만이 됨.</summary>
     NegativeQuantity,
+    /// <summary>통로를 놓을 지상 중심 타일에 고체 블록이 있음.</summary>
+    PassageBlockedBySolid,
+    /// <summary>통로의 개미집 굴착 영역(3×3)이 맵 안에 완전히 들어가지 않음.</summary>
+    PassageAreaOutOfBounds,
 }

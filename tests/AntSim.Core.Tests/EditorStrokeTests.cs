@@ -49,11 +49,24 @@ public class EditorStrokeTests
     public void Stroke_LeavingMap_IgnoresOutOfBoundsTiles()
     {
         var editor = new MapEditor(TestWorlds.Create(10, 10));
-        var stroke = EditorStroke.Begin(editor, new EditorTool(EditorToolKind.AddPassage), LayerId.Surface, 8, 5);
+        var stroke = EditorStroke.Begin(editor, new EditorTool(EditorToolKind.PaintTerrain, Terrain: Terrain.Water), LayerId.Surface, 8, 5);
         stroke.MoveTo(15, 5);
         stroke.End();
-        Assert.Equal(2, editor.World.Passages.Count);
+        Assert.Equal(2, stroke.AppliedCount);
         Assert.Equal(0, stroke.FailedCount);
+    }
+
+    [Fact]
+    public void PassageStroke_ReportsEdgeTilesWhoseDigAreaDoesNotFit()
+    {
+        var editor = new MapEditor(TestWorlds.Create(10, 10));
+        var stroke = EditorStroke.Begin(editor, new EditorTool(EditorToolKind.AddPassage), LayerId.Surface, 7, 5);
+        stroke.MoveTo(15, 5);
+        stroke.End();
+        Assert.Equal(2, editor.World.Passages.Count);   // x = 7, 8
+        Assert.Equal(1, stroke.FailedCount);            // x = 9 (가장자리)
+        Assert.Equal(WorldError.PassageAreaOutOfBounds, stroke.LastError);
+        Assert.Equal(1, editor.UndoCount);
     }
 
     [Fact]

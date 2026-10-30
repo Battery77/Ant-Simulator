@@ -59,6 +59,16 @@ public sealed class WorldLayer
 
     internal void MarkDirty(int x, int y) => ChunkAt(x, y).MarkDirty();
 
+    internal void FillUnchecked(TilePlane plane, byte value)
+    {
+        foreach (var chunk in _chunks) chunk.Fill(plane, value);
+    }
+
+    internal void CopyFrom(WorldLayer source)
+    {
+        for (int i = 0; i < _chunks.Length; i++) _chunks[i].CopyFrom(source._chunks[i]);
+    }
+
     /// <summary>
     /// 마지막 수집 이후 변경된 청크를 행 우선 순서로 <paramref name="output"/>에 추가하고 더티 표시를 지운다.
     /// </summary>

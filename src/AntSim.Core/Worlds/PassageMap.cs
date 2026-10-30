@@ -46,6 +46,13 @@ public sealed class PassageMap
         return true;
     }
 
+    internal void CopyFrom(PassageMap source)
+    {
+        source._bits.CopyTo(_bits, 0);
+        Count = source.Count;
+        Version = source.Version;
+    }
+
     /// <summary>모든 통로의 선형 인덱스(y * Width + x)를 오름차순으로 추가한다.</summary>
     public void CopyIndicesTo(List<int> output)
     {
