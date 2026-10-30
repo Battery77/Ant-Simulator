@@ -42,6 +42,12 @@ public static class ExperimentSerializer
 
     /// <summary>냄새 종류 수 상한(<see cref="ScentSettings.MaxTypes"/>와 같다: 저장할 수 있으면 불러올 수 있다).</summary>
     public const int MaxScentTypes = ScentSettings.MaxTypes;
+
+    /// <summary>v2 개미 한 마리의 저장 크기: id 4 + caste·layer·mobility 3 + f32 × 11 + lastTile 4 + rng 8 = 63바이트.</summary>
+    internal const int BytesPerAnt = 4 + 3 + 11 * sizeof(float) + 4 + 8;
+
+    /// <summary>v2 개미 설정의 고정 부분: initialCount 4 + seed 8 + f32 × 12 + tierCount 4 = 64바이트(구간은 각 8바이트).</summary>
+    private const int AntSettingsFixedBytes = 4 + 8 + 12 * sizeof(float) + 4;
     private static ReadOnlySpan<byte> Magic => "ANTEXP\0\0"u8;
 
     public static void Save(SimulationSession session, Stream stream)
@@ -123,6 +129,11 @@ public static class ExperimentSerializer
             if (mapBytes > int.MaxValue)
                 throw new InvalidOperationException($"월드가 너무 커서 실험 파일에 담을 수 없습니다({mapBytes}바이트).");
         }
+        var antErrors = session.AntSettings.Validate();
+        if (antErrors.Count > 0)
+            throw new InvalidOperationException($"저장할 수 없는 개미 설정입니다: {string.Join(" ", antErrors)}");
+        if (ValidateAnts(session.Ants.Count, session.Ants.NextId, session.Ants, session.World) is { } antError)
+            throw new InvalidOperationException($"저장할 수 없는 개미 상태입니다: {antError}");
     }
 
     public static SimulationSession Load(string path)
@@ -231,12 +242,14 @@ public static class ExperimentSerializer
 
     private static AntSettings ReadAntSettings(ChecksumReader reader)
     {
+        StreamLimits.Require(reader.BaseStream, AntSettingsFixedBytes, "개미 설정");
         int count = reader.ReadInt32();
         ulong seed = (ulong)reader.ReadInt64();
         var v = new float[12];
         for (int i = 0; i < v.Length; i++) v[i] = reader.ReadSingle();
         int tierCount = reader.ReadInt32();
         if (tierCount < 1 || tierCount > 256) throw new MapFormatException($"개미 속도 구간 수가 잘못되었습니다: {tierCount}.");
+        StreamLimits.Require(reader.BaseStream, 8L * tierCount, "개미 속도 구간");
         var tiers = new SpeedTier[tierCount];
         for (int i = 0; i < tierCount; i++) tiers[i] = new SpeedTier(reader.ReadInt32(), reader.ReadSingle());
 
@@ -269,9 +282,13 @@ public static class ExperimentSerializer
 
     private static void ReadAnts(ChecksumReader reader, AntPopulation ants, World world)
     {
+        StreamLimits.Require(reader.BaseStream, 8, "개미 수");
         int n = reader.ReadInt32();
         int nextId = reader.ReadInt32();
         if (n < 0 || n > AntSettings.MaxCount) throw new MapFormatException($"개미 수가 잘못되었습니다: {n}.");
+        if (nextId < n) throw new MapFormatException($"다음 개미 ID가 잘못되었습니다: {nextId} (개미 {n}마리).");
+        // 개체 배열을 만들기 전에 개미 본문 전체와 체크섬이 실제로 있는지 확인한다(n ≤ 100,000이라 long 곱은 넘치지 않는다).
+        StreamLimits.Require(reader.BaseStream, (long)BytesPerAnt * n + 8, "개미 상태");
         ants.SetCount(n, nextId);
         reader.Read(MemoryMarshal.AsBytes(ants.IdArray.AsSpan(0, n)));
         reader.Read(ants.CasteArray.AsSpan(0, n));
@@ -281,18 +298,49 @@ public static class ExperimentSerializer
         reader.Read(MemoryMarshal.AsBytes(ants.LastTileArray.AsSpan(0, n)));
         reader.Read(MemoryMarshal.AsBytes(ants.RngArray.AsSpan(0, n)));
 
-        // 불러온 개미가 규칙을 어기는 위치(맵 밖·물·고체)에 있으면 거부한다.
+        if (ValidateAnts(n, nextId, ants, world) is { } error) throw new MapFormatException(error);
+    }
+
+    /// <summary>
+    /// 개미 개체 상태가 형식 계약을 만족하는지 검사한다(저장 전·불러온 뒤 같은 규칙: 저장할 수 있으면 불러올 수 있다).
+    /// 문제가 없으면 null, 있으면 첫 문제의 설명.
+    /// </summary>
+    internal static string? ValidateAnts(int n, int nextId, AntPopulation ants, World world)
+    {
+        if (n < 0 || n > AntSettings.MaxCount) return $"개미 수가 잘못되었습니다: {n}.";
+        if (nextId < n) return $"다음 개미 ID가 잘못되었습니다: {nextId} (개미 {n}마리).";
+        int width = world.Config.Width, height = world.Config.Height, tiles = world.Config.TileCount;
+        var ids = new HashSet<int>(n);
         for (int i = 0; i < n; i++)
         {
-            if (ants.IdArray[i] < 0 || ants.IdArray[i] >= nextId) throw new MapFormatException($"개미 ID가 잘못되었습니다: {ants.IdArray[i]}.");
+            int id = ants.IdArray[i];
+            if (id < 0 || id >= nextId) return $"개미 ID가 잘못되었습니다: {id}.";
+            if (!ids.Add(id)) return $"개미 ID가 중복되었습니다: {id}.";
             if (ants.LayerArray[i] >= World.LayerCount || ants.CasteArray[i] != (byte)AntCaste.Worker || ants.MobilityArray[i] != (byte)AntMobility.Walk)
-                throw new MapFormatException($"개미 {ants.IdArray[i]}의 레이어·계급·이동 능력이 잘못되었습니다.");
-            var layer = world.GetLayer((LayerId)ants.LayerArray[i]);
-            if (!float.IsFinite(ants.XArray[i]) || !float.IsFinite(ants.YArray[i]) ||
-                !AntMovement.IsPassable(layer, ants.XArray[i], ants.YArray[i]))
-                throw new MapFormatException($"개미 {ants.IdArray[i]}이 이동할 수 없는 위치에 있습니다.");
+                return $"개미 {id}의 레이어·계급·이동 능력이 잘못되었습니다.";
+            float x = ants.XArray[i], y = ants.YArray[i];
+            if (!float.IsFinite(x) || !float.IsFinite(y) || !AntMovement.IsPassable(world.GetLayer((LayerId)ants.LayerArray[i]), x, y))
+                return $"개미 {id}이(가) 이동할 수 없는 위치에 있습니다.";
+            float px = ants.PrevXArray[i], py = ants.PrevYArray[i];
+            if (!(px >= 0 && px < width && py >= 0 && py < height)) return $"개미 {id}의 이전 위치가 맵 밖입니다.";
+            if (!(MathF.Abs(ants.HeadingArray[i]) <= MaxAngle && MathF.Abs(ants.TargetHeadingArray[i]) <= MaxAngle))
+                return $"개미 {id}의 방향이 잘못되었습니다.";
+            if (!(ants.BaseSpeedArray[i] > 0 && float.IsFinite(ants.BaseSpeedArray[i]))) return $"개미 {id}의 기본 속도가 잘못되었습니다.";
+            if (!(ants.SpeedFactorArray[i] > 0 && ants.SpeedFactorArray[i] <= MaxSpeedFactor)) return $"개미 {id}의 속도 배율이 잘못되었습니다.";
+            if (!(ants.SizeArray[i] > 0 && float.IsFinite(ants.SizeArray[i]))) return $"개미 {id}의 크기가 잘못되었습니다.";
+            if (!float.IsFinite(ants.TurnTimerArray[i])) return $"개미 {id}의 방향 변경 타이머가 잘못되었습니다.";
+            if (!(ants.TurnIntervalScaleArray[i] > 0 && float.IsFinite(ants.TurnIntervalScaleArray[i]))) return $"개미 {id}의 방향 변경 간격 배율이 잘못되었습니다.";
+            if ((uint)ants.LastTileArray[i] >= (uint)tiles) return $"개미 {id}의 마지막 타일이 잘못되었습니다.";
+            if (ants.RngArray[i] == 0) return $"개미 {id}의 난수 상태가 0입니다(xorshift 상태는 0이 될 수 없다).";
         }
+        return null;
     }
+
+    /// <summary>방향 각도 허용 범위(이동 계산은 (−π, π]로 정규화한다. 여유를 둔 2π).</summary>
+    private const float MaxAngle = 2 * MathF.PI;
+
+    /// <summary>속도 배율 허용 상한(구간 배율 ≤ 1로 수렴하며, 반올림 여유를 둔다).</summary>
+    private const float MaxSpeedFactor = 1.001f;
 
     private static float[][] FloatArrays(AntPopulation a) => new[]
     {
