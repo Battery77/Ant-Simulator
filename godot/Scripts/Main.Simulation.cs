@@ -26,6 +26,9 @@ public partial class Main
     private long _frameTick = -1;
     private long _frameResetCount = -1;
     private ulong _frameArrivalMs;
+
+    /// <summary>실험 빠른 저장(Ctrl+S) 대상. 새 실험·v1 파일이면 없음(저장 대화상자를 연다).</summary>
+    private string? _experimentPath;
     private SimulationPanel _simPanel = null!;
     private ModeBar _modeBar = null!;
     private SimulationHost? _host;
@@ -66,8 +69,7 @@ public partial class Main
         _simPanel.SettingsApplyRequested += settings => _ = ApplySettings(settings);
         _simPanel.LayerChanged += SetLayer;
         _simPanel.AntSettingsApplyRequested += settings => _ = ApplyAntSettings(settings);
-        _simPanel.SaveExperimentRequested += () =>
-            ShowFileDialog(FileDialog.FileModeEnum.SaveFile, ExperimentFileFilter, path => _ = SaveExperiment(path));
+        _simPanel.SaveExperimentRequested += ShowExperimentSaveDialog;
         _simPanel.LoadExperimentRequested += () =>
             ShowFileDialog(FileDialog.FileModeEnum.OpenFile, ExperimentFileFilter, LoadExperiment);
     }
@@ -103,6 +105,7 @@ public partial class Main
         _simWorld = session.World.Clone();
         _minResetCount = session.ResetCount;
         _host = new SimulationHost(session) { Speed = _speed };
+        _experimentPath = null; // 불러오기면 LoadExperiment가 다시 정한다
         _mode = AppMode.Simulation;
         _pinnedTile = null;
         _panel.Visible = false;
@@ -379,6 +382,9 @@ public partial class Main
             case Key.Period:
                 _ = StepOnce();
                 return true;
+            case Key.S when key.CtrlPressed || key.MetaPressed:
+                QuickSaveExperiment();
+                return true;
             default:
                 return false;
         }
@@ -492,41 +498,70 @@ public partial class Main
         }
     }
 
+    /// <summary>
+    /// 실험 저장(대화상자·Ctrl+S 공용). 계산 스레드의 명령으로 틱 사이에 저장하며(<see cref="ExperimentSerializer"/>, v2, 임시 파일 교체),
+    /// 저장이 실제로 끝난 뒤에만 성공을 알린다. 성공한 경로는 이후 Ctrl+S 빠른 저장 대상이 된다.
+    /// </summary>
     private async Task SaveExperiment(string path)
     {
         if (_host is null) return;
         var host = _host;
         try
         {
-            long tick = await host.RunExclusiveAsync(session =>
+            await host.RunExclusiveAsync(session =>
             {
                 ExperimentSerializer.Save(session, path);
                 return session.Tick;
             });
-            string done = $"실험 상태 저장됨 (틱 {tick}): {path}";
-            if (host == _host) _simPanel.SetStatus(done);
-            else _panel.SetStatus(done);
+            if (host == _host) _experimentPath = path;
+            NotifySaved("실험", path, simulationPanel: host == _host);
         }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException
+                                       or OperationCanceledException or ObjectDisposedException
+                                       or InvalidOperationException) // 계산 스레드 실패, 저장할 수 없는 상태(ValidateForSave)
         {
-            if (host == _host) _simPanel.SetStatus($"실험 저장 실패: {e.Message}");
-            else _panel.SetStatus($"실험 저장 실패: {e.Message}");
-        }
-        catch (Exception e) when (e is OperationCanceledException or ObjectDisposedException or InvalidOperationException)
-        {
-            ReportCommandStopped(host, "실험 저장", e); // 종료로 취소, 계산 스레드 실패, 저장 불가 상태(ValidateForSave)
+            NotifySaveFailed("실험", path, e, simulationPanel: host == _host);
         }
     }
+
+    /// <summary>
+    /// Ctrl+S(시뮬레이션 모드): 이 실험을 저장한 적이 있거나 v2 파일에서 불러왔으면 그 파일에 바로 저장, 아니면 저장 대화상자.
+    /// 맵 파일 경로(<see cref="_currentPath"/>)와는 따로 관리한다.
+    /// </summary>
+    private void QuickSaveExperiment()
+    {
+        if (_experimentPath is { } path) _ = SaveExperiment(path);
+        else ShowExperimentSaveDialog();
+    }
+
+    private void ShowExperimentSaveDialog() =>
+        ShowFileDialog(FileDialog.FileModeEnum.SaveFile, ExperimentFileFilter, path => _ = SaveExperiment(path));
 
     private void LoadExperiment(string path)
     {
         try
         {
-            StartSimulation(ExperimentSerializer.Load(path));
+            var loaded = ExperimentSerializer.Load(path);
+            var previous = _host;
+            StartSimulation(loaded);
+            if (_host is null || _host == previous) return;
+            // v2 파일이면 Ctrl+S가 그 파일에 저장한다. v1 파일은 저장 형식(v2)이 달라지므로 원본을 덮어쓰지 않도록 빠른 저장 대상으로 삼지 않는다.
+            bool v2 = ReadExperimentVersion(path) >= 2;
+            _experimentPath = v2 ? path : null;
+            if (!v2) _simPanel.SetStatus($"v1 실험 파일을 불러왔습니다(개미 없음). 저장하면 새 파일에 v2 형식으로 저장합니다. (틱 {loaded.Tick})");
         }
         catch (Exception e) when (e is MapFormatException or IOException or UnauthorizedAccessException)
         {
             _simPanel.SetStatus($"실험 불러오기 실패: {e.Message}");
         }
+    }
+
+    /// <summary>실험 파일 헤더의 형식 버전(magic 8바이트 다음 u16). 이미 정상으로 불러온 파일에만 쓴다.</summary>
+    private static int ReadExperimentVersion(string path)
+    {
+        Span<byte> header = stackalloc byte[10];
+        using var file = File.OpenRead(path);
+        file.ReadExactly(header);
+        return System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(header[8..]);
     }
 }

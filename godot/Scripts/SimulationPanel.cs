@@ -118,7 +118,7 @@ public partial class SimulationPanel : PanelContainer
         scroll.AddChild(root);
 
         // 편집 패널과 같은 위치·방식의 레이어 전환(편집 패널은 시뮬레이션 모드에서 숨겨지므로 여기에도 둔다).
-        root.AddChild(Header("보는 레이어 (Tab)"));
+        root.AddChild(Header("보는 레이어 (Ctrl+Tab)"));
         var layers = new HBoxContainer();
         root.AddChild(layers);
         foreach (var layer in new[] { LayerId.Surface, LayerId.Nest })
@@ -194,7 +194,7 @@ public partial class SimulationPanel : PanelContainer
         root.AddChild(Header("실험 상태"));
         var file = new HBoxContainer();
         root.AddChild(file);
-        file.AddChild(ActionButton("실험 저장", () => SaveExperimentRequested?.Invoke()));
+        file.AddChild(ActionButton("실험 저장 (Ctrl+S)", () => SaveExperimentRequested?.Invoke()));
         file.AddChild(ActionButton("실험 불러오기", () => LoadExperimentRequested?.Invoke()));
 
         root.AddChild(Header("상태"));
