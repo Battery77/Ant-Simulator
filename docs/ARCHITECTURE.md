@@ -1,6 +1,6 @@
 # 아키텍처
 
-> 월드 데이터, 맵 편집기, 냄새 시스템, 편집/시뮬레이션 모드 분리까지 구현된 기준. 개미·여왕개미는 아직 없다.
+> 월드 데이터, 맵 편집기, 냄새 시스템, 편집/시뮬레이션 모드 분리, 일개미 이동(단계 A)까지 구현된 기준. 여왕개미·개미 AI(단계 B 이후)는 아직 없다.
 > 작업 계획·테스트·성능 측정 계획은 [`PLAN.md`](PLAN.md), 미정 규칙은 [`OPEN_QUESTIONS.md`](OPEN_QUESTIONS.md).
 
 ## 1. 프로젝트 구조
@@ -17,12 +17,13 @@ src/AntSim.Core/                 # 순수 C# 시뮬레이션 코어 (net8.0, God
   Worlds/        + WorldPresets(Empty, StandardNest), World.Clone
   Scent/         ScentSettings(검증), ScentState(종류×레이어 float 이중 버퍼), ScentSystem
   Simulation/    SimulationSession(복제 월드 실험), SimulationHost(계산 스레드)
+  Ants/          AntSettings, AntPopulation(SoA), AntSystem(이동), AntMovement(통과·경로 검사), AntSpawner, AntRandom
   Serialization/ + ExperimentSerializer(.antexp), ChecksumStreams
   Rendering/     + HeatmapRasterizer
 godot/                           # Godot 4 .NET 프로젝트 (렌더링·입력·UI만)
   project.godot, Main.tscn, AntSim.App.csproj, AntSim.App.sln
   Scripts/ Main(조립 루트·입력), Main.Simulation(시뮬레이션 모드), MapView(청크 텍스처),
-           HeatmapView, EditorCamera, EditorPanel, SimulationPanel, ModeBar, Main.SmokeTest
+           HeatmapView, AntView(MultiMesh), EditorCamera, EditorPanel, SimulationPanel, ModeBar, Main.SmokeTest
 tests/AntSim.Core.Tests/         # xUnit, Godot 없이 실행
 tools/AntSim.Benchmarks/         # 기준 성능 측정
 tools/godot-smoke-test.sh        # Godot 통합 점검 (헤드리스 / xvfb)
@@ -99,13 +100,31 @@ ScentState        { [종류][레이어] float[] Current / Next }     // 레이�
 - 팔레트(`CompositeHeatmapPalette`)는 냄새 키 → 색. 새 페로몬은 예비 색을 자동 배정하며 `Set`으로 교체할 수 있다.
 - 계산 스레드는 재생 중 스냅샷을 최대 30Hz로만 게시(명령·선택 변경·일시정지 시 즉시)한다.
 
+### 개미 (단계 A)
+
+- `AntPopulation`: 속성별 연속 배열(SoA). 개미마다 객체·Godot 노드를 만들지 않는다. 순회는 인덱스 순서.
+- 한 틱(`AntSystem.Tick`): 개체별 간격(0.5~1초 × 개체 편차)마다 현재 방향 ±30° 안에서 목표 방향 선택 → 최대 회전 속도로 회전 →
+  현재 타일 먹이+유충 수량에 따른 속도 배율(100/95/90/85%)로 부드럽게 수렴 → 격자 DDA로 경로의 모든 타일을 검사하며 이동(관통·모서리 틈 방지)
+  → 막히면 경계 앞에서 멈추고 열린 방향으로 돌아섬 → 통로 중심 타일에 새로 들어서면 확률적으로 레이어 전환.
+- 통과 가능: 흙(먹이·유충 포함) / 불가: 물, 토양, 바위, 맵 밖. 이동 능력(`AntMobility`)은 플래그라 이후 수영 등을 추가할 수 있다.
+- 결정성: 개체별 xorshift64* 난수 상태를 배열에 저장. 같은 시드·월드·설정이면 같은 결과(실험 파일 저장 후 이어서 실행해도 동일).
+- 시뮬레이션 틱 순서: 냄새 → 개미. Reset은 개미를 같은 시드로 다시 생성한다(ID도 0부터 다시 → 같은 시드면 같은 결과).
+- 표시: 계산 스레드가 개미 위치(이전·현재 틱)를 스냅샷(`AntFrame`)으로 게시하고, Godot `AntView`가 MultiMesh 하나로 그리며 틱 사이를 보간한다.
+- 스냅샷의 냄새 필드와 `AntFrame`은 계산 스레드가 같은 세션 상태에서 함께 채우며 같은 `ResetCount`(초기화 세대)를 가진다.
+  화면은 세대가 낮은 스냅샷을 버리고, 보간 시작 시각은 (세대, 틱)이 바뀔 때 갱신하며, 선택한 개미도 세대를 기억해
+  초기화 뒤 같은 ID의 다른 개미를 가리키지 않는다. 초기화 직후 프레임은 이전 위치 = 현재 위치라 이전 세대 좌표에서 보간하지 않는다.
+- 화면이 들고 있는 스냅샷 배열은 반납(`Release`) 전까지 계산 스레드가 쓰지 않는다. `AntView`는 프레임을 자기 버퍼로 복사해 그린다.
+- 틱당 관리 힙 할당 없음(테스트로 확인: 5,000마리 1틱 < 1KB).
+- 보는 레이어(지상/개미집)는 표시 상태다. 편집 패널과 시뮬레이션 패널 맨 위의 "레이어 (Ctrl+Tab)" 버튼, Ctrl+Tab 키가 같은 `Main.SetLayer`를
+  거치며 지형·그 레이어의 개미·그 레이어의 히트맵·타일 정보만 바꾼다. 개미의 실제 레이어·냄새·틱·재생 상태·호스트는 바꾸지 않는다.
+
 ### 편집 / 시뮬레이션 모드
 
 | | 편집 모드 | 시뮬레이션 모드 |
 |---|---|---|
 | 월드 | 원본(`Main._world`) | 시작 시 복제(`SimulationSession`) |
-| 쓰기 | `MapEditor`(원자적 명령, Undo/Redo) | 계산 스레드의 세션만(현재는 냄새만 변함) |
-| 저장 | 맵 파일 `.antmap` (v1, 이전과 같음) | 실험 상태 파일 `.antexp` (설정·틱·시작 월드·현재 월드·냄새) |
+| 쓰기 | `MapEditor`(원자적 명령, Undo/Redo) | 계산 스레드의 세션만(현재는 냄새·개미만 변함, 월드는 그대로) |
+| 저장 | 맵 파일 `.antmap` (v1, 이전과 같음) | 실험 상태 파일 `.antexp` v2 (설정·틱·시작 월드·현재 월드·냄새·개미 설정·개미 상태). v1 파일도 읽음 |
 | 원본 반영 | — | 하지 않음. 편집 모드로 돌아가면 원본 그대로 |
 
 계산 스레드 명령 계약(`SimulationHost`, 감사 F02/F07/F05):
@@ -115,7 +134,11 @@ ScentState        { [종류][레이어] float[] Current / Next }     // 레이�
 - 실행권: 계산 스레드는 같은 lock 안에서 "상태가 Running인지 확인 + 큐에서 꺼내기"를 한 번에 한다(재검증 F02). 꺼낸 명령만
   끝까지 실행되고, Dispose가 먼저 Stopping으로 바꾸면 남은 명령은 콜백 없이 취소된다.
 - 명령이 예외로 끝나도 그때까지 바뀐 세션 상태는 그대로이며 호스트 틱과 다음 스냅샷이 그 상태를 따른다.
-- `ResetAsync`는 초기화된 월드 복제와 초기화 세대(`ResetCount`)를 돌려준다. 화면은 이 월드로 바꾸고, 세대가 낮은 스냅샷은 버린다.
+- `ResetAsync(AntSettings? ants = null)`: 한 명령 안에서 시작 월드 복원·냄새 0·틱/경과 시간 0·개미 재생성(설정을 주면 그 설정으로)·
+  세대 증가를 한다. 결과 `SimulationResetResult(World, ResetCount, Tick, Ants)`는 같은 틱 경계의 표시용 월드 복제, 초기화 세대,
+  개미 생성 결과(요청/생성 수)다. 개미 설정이 잘못되면 아무것도 바꾸지 않고 `ArgumentException`으로 실패한다.
+  화면의 초기화 버튼과 "개미 설정 적용"은 같은 경로(`Main.ResetHost`)로 표시 월드를 바꾸고 세대가 낮은 스냅샷을 버린다.
+  결과가 오기 전에 호스트가 바뀌었으면(불러오기·모드 전환) 결과를 무시한다.
 
 파일 로더 검증(감사 F01/E01, 재검증 N01): 크기 필드로 배열을 만들기 전에 실제 남은 바이트를 확인한다. `Load(Stream)`은 레코드 하나만
 읽고 체크섬 직후 반환하므로 뒤에 이어진 데이터는 스트림에 남는다. 길이를 알 수 없는(seek 불가) 스트림은 끝까지 미리 읽지 않고,
@@ -123,6 +146,12 @@ ScentState        { [종류][레이어] float[] Current / Next }     // 레이�
 받은 데이터의 약 2배 + 4KiB 이내). 잘못된 매직 값은 첫 8바이트만 읽고 거부한다. 정상 대형 레코드는 검증 구간(맵 본문, 냄새 농도)을
 메모리에 받아 둔 뒤 읽으므로, seek 불가 입력의 최대 추가 메모리는 그 레코드 크기 정도다. 실험 파일의 내장 맵은 선언된 구간만 읽는
 체크섬 스트림으로 읽는다.
+
+실험 파일 v2(개미): 저장은 항상 v2, 불러오기는 v1·v2. v1은 월드·냄새·틱·경과 시간을 그대로 두고 개미 0마리(`AntSettings.None`).
+v2의 레코드 끝은 개미 구간 뒤의 체크섬이다. 개미 설정(고정 64바이트 + 구간 8바이트씩)과 개미 본문(개미당 63바이트 × 수 + 체크섬)은
+개체 배열을 만들기 전에 실제로 있는지 확인한다(개미 수 0~100,000, nextId ≥ 수). 개체 필드 규칙(`ExperimentSerializer.ValidateAnts`)은
+저장 전 검사와 불러오기가 같이 쓴다: ID 고유·[0, nextId), 일개미·걷기·레이어 0/1, 위치는 유한하고 이동 가능한 타일, 이전 위치는 맵 안,
+방향 |θ| ≤ 2π, 속도·크기·간격 배율 > 0 유한, 속도 배율 (0, 1.001], 타이머 유한, 마지막 타일 맵 안, 난수 상태 ≠ 0.
 
 실행 중 임의 편집(실험 도구)은 아직 없다. 추가할 때는 `SimulationHost.RunExclusiveAsync`로 틱 사이에 세션을 바꾸는 방식이 된다.
 

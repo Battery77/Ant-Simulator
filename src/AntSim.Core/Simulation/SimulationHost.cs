@@ -1,8 +1,53 @@
 using System.Diagnostics;
+using AntSim.Core.Ants;
 using AntSim.Core.Rendering;
 using AntSim.Core.Worlds;
 
 namespace AntSim.Core.Simulation;
+
+/// <summary>
+/// 게시된 개미 표시 데이터(전 레이어, 복사본). 화면은 PrevX/PrevY → X/Y 사이를 보간해 틱 사이에도 부드럽게 그린다.
+/// 배열은 스냅샷 풀과 함께 재사용된다.
+/// </summary>
+public sealed class AntFrame
+{
+    public int Count { get; private set; }
+    public int[] Id { get; private set; } = Array.Empty<int>();
+    public byte[] Layer { get; private set; } = Array.Empty<byte>();
+    public float[] X { get; private set; } = Array.Empty<float>();
+    public float[] Y { get; private set; } = Array.Empty<float>();
+    public float[] PrevX { get; private set; } = Array.Empty<float>();
+    public float[] PrevY { get; private set; } = Array.Empty<float>();
+    public float[] Heading { get; private set; } = Array.Empty<float>();
+    public float[] Size { get; private set; } = Array.Empty<float>();
+    public float[] BaseSpeed { get; private set; } = Array.Empty<float>();
+    public float[] SpeedFactor { get; private set; } = Array.Empty<float>();
+
+    /// <summary>레이어별 개미 수.</summary>
+    public int CountOn(LayerId layer)
+    {
+        int n = 0;
+        for (int i = 0; i < Count; i++)
+            if (Layer[i] == (byte)layer) n++;
+        return n;
+    }
+
+    internal void Fill(AntPopulation ants)
+    {
+        int n = ants.Count;
+        if (Id.Length < n)
+        {
+            int capacity = Math.Max(n, Id.Length * 2);
+            Id = new int[capacity]; Layer = new byte[capacity];
+            X = new float[capacity]; Y = new float[capacity]; PrevX = new float[capacity]; PrevY = new float[capacity];
+            Heading = new float[capacity]; Size = new float[capacity]; BaseSpeed = new float[capacity]; SpeedFactor = new float[capacity];
+        }
+        ants.Ids.CopyTo(Id); ants.Layer.CopyTo(Layer);
+        ants.X.CopyTo(X); ants.Y.CopyTo(Y); ants.PrevX.CopyTo(PrevX); ants.PrevY.CopyTo(PrevY);
+        ants.Heading.CopyTo(Heading); ants.Size.CopyTo(Size); ants.BaseSpeed.CopyTo(BaseSpeed); ants.SpeedFactor.CopyTo(SpeedFactor);
+        Count = n;
+    }
+}
 
 /// <summary>
 /// 계산 스레드가 게시한 냄새 필드 복사본(한 레이어, 선택한 냄새 종류들). 사용 후 <see cref="SimulationHost.Release"/>로 반납한다.
@@ -30,8 +75,11 @@ public sealed class ScentSnapshot
     public long Tick { get; internal set; }
     public double ElapsedSeconds { get; internal set; }
 
-    /// <summary>게시 시점의 초기화 세대(<see cref="SimulationSession.ResetCount"/>).</summary>
+    /// <summary>게시 시점의 초기화 세대(<see cref="SimulationSession.ResetCount"/>). 냄새 필드와 <see cref="Ants"/>에 함께 적용된다.</summary>
     public long ResetCount { get; internal set; }
+
+    /// <summary>같은 틱·같은 초기화 세대의 개미 표시 데이터(히트맵 선택과 무관하게 항상 포함).</summary>
+    public AntFrame Ants { get; } = new();
 
     public bool Contains(int type) => Array.IndexOf(_types, type) >= 0;
 
@@ -167,16 +215,18 @@ public sealed class SimulationHost : IDisposable
     }
 
     /// <summary>
-    /// 시작 상태로 초기화하고 일시정지한다. 결과에는 초기화된 계산 월드를 같은 틱 경계에서 복제한
-    /// 표시용 월드와 초기화 세대가 들어 있다(화면이 계산 월드와 같은 상태를 그리도록).
+    /// 시작 상태(시작 월드, 냄새 0, 틱 0, 개미 재생성)로 초기화하고 일시정지한다. <paramref name="ants"/>를 주면 그 설정으로 개미를 다시 만든다.
+    /// 한 명령 안에서 월드·냄새·개미·초기화 세대를 함께 바꾸며, 결과에는 같은 틱 경계에서 복제한 표시용 월드,
+    /// 초기화 세대, 개미 생성 결과가 들어 있다(화면이 계산 상태와 같은 상태를 그리도록).
+    /// 개미 설정이 잘못되었으면 아무것도 바꾸지 않고 Task가 <see cref="ArgumentException"/>으로 실패한다.
     /// </summary>
-    public Task<SimulationResetResult> ResetAsync()
+    public Task<SimulationResetResult> ResetAsync(AntSettings? ants = null)
     {
         _playing = false;
         return RunExclusiveAsync(session =>
         {
-            session.Reset();
-            return new SimulationResetResult(session.World.Clone(), session.ResetCount, session.Tick);
+            session.Reset(ants);
+            return new SimulationResetResult(session.World.Clone(), session.ResetCount, session.Tick, session.LastSpawn);
         });
     }
 
@@ -448,6 +498,7 @@ public sealed class SimulationHost : IDisposable
         foreach (int type in requested)
             if ((uint)type < (uint)typeCount) types[count++] = type;
         snapshot.Fill(types[..count], _session.Scent, layer);
+        snapshot.Ants.Fill(_session.Ants);
         snapshot.Tick = _session.Tick;
         snapshot.ElapsedSeconds = _session.ElapsedSeconds;
         snapshot.ResetCount = _session.ResetCount;
@@ -462,6 +513,7 @@ public sealed class SimulationHost : IDisposable
 
 /// <summary>
 /// 초기화 결과. <see cref="World"/>는 초기화 직후 계산 월드를 같은 틱 경계에서 복제한 것으로, 호출자(화면)가 소유한다.
-/// <see cref="ResetCount"/>보다 작은 세대의 스냅샷은 초기화 이전 상태이므로 화면에서 버려야 한다.
+/// <see cref="ResetCount"/>보다 작은 세대의 스냅샷(냄새·<see cref="AntFrame"/>)은 초기화 이전 상태이므로 화면에서 버려야 한다.
+/// <see cref="Ants"/>는 이 초기화에서 개미를 생성한 결과다(요청 수, 실제 생성 수).
 /// </summary>
-public sealed record SimulationResetResult(Worlds.World World, long ResetCount, long Tick);
+public sealed record SimulationResetResult(Worlds.World World, long ResetCount, long Tick, AntSpawnReport Ants);

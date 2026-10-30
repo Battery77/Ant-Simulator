@@ -1,3 +1,4 @@
+using AntSim.Core.Ants;
 using AntSim.Core.Editing;
 using AntSim.Core.Rendering;
 using AntSim.Core.Scent;
@@ -18,6 +19,16 @@ public partial class Main
     private const string ExperimentFileFilter = "*.antexp ; 개미 시뮬레이터 실험 상태";
 
     private HeatmapView _heatmap = null!;
+    private AntView _antView = null!;
+    private AntSettings _antSettings = AntSettings.Default;
+    private int _selectedAntId = -1;
+    private long _selectedAntResetCount = -1; // 선택한 개미의 초기화 세대(초기화 뒤 같은 ID의 다른 개미를 가리키지 않도록)
+    private long _frameTick = -1;
+    private long _frameResetCount = -1;
+    private ulong _frameArrivalMs;
+
+    /// <summary>실험 빠른 저장(Ctrl+S) 대상. 새 실험·v1 파일이면 없음(저장 대화상자를 연다).</summary>
+    private string? _experimentPath;
     private SimulationPanel _simPanel = null!;
     private ModeBar _modeBar = null!;
     private SimulationHost? _host;
@@ -56,8 +67,9 @@ public partial class Main
             SelectHeatmapOnHost();
         };
         _simPanel.SettingsApplyRequested += settings => _ = ApplySettings(settings);
-        _simPanel.SaveExperimentRequested += () =>
-            ShowFileDialog(FileDialog.FileModeEnum.SaveFile, ExperimentFileFilter, path => _ = SaveExperiment(path));
+        _simPanel.LayerChanged += SetLayer;
+        _simPanel.AntSettingsApplyRequested += settings => _ = ApplyAntSettings(settings);
+        _simPanel.SaveExperimentRequested += ShowExperimentSaveDialog;
         _simPanel.LoadExperimentRequested += () =>
             ShowFileDialog(FileDialog.FileModeEnum.OpenFile, ExperimentFileFilter, LoadExperiment);
     }
@@ -77,7 +89,7 @@ public partial class Main
         SimulationSession session;
         try
         {
-            session = loaded ?? new SimulationSession(_world, _scentSettings);
+            session = loaded ?? new SimulationSession(_world, _scentSettings, _antSettings);
         }
         catch (ArgumentException e)
         {
@@ -88,22 +100,30 @@ public partial class Main
 
         // 호스트(계산 스레드)에 넘기기 전에 표시용 복제본을 만든다. 이후 세션은 계산 스레드만 다룬다.
         _scentSettings = session.Settings;
+        _antSettings = session.AntSettings;
+        var spawn = session.LastSpawn;
         _simWorld = session.World.Clone();
         _minResetCount = session.ResetCount;
         _host = new SimulationHost(session) { Speed = _speed };
+        _experimentPath = null; // 불러오기면 LoadExperiment가 다시 정한다
         _mode = AppMode.Simulation;
         _pinnedTile = null;
         _panel.Visible = false;
         _simPanel.Visible = true;
         _modeBar.SetMode(AppMode.Simulation);
         _simPanel.SetSettings(_scentSettings);
+        _simPanel.SetAntSettings(_antSettings);
+        _simPanel.SetLayer(_view.Layer); // 편집 모드에서 보던 레이어를 그대로 보여 준다
         _simPanel.SetSettingsMessage("");
+        ClearAntSelection();
+        _frameTick = _frameResetCount = -1;
         _heatmapOptions = _simPanel.Heatmap;
         _view.SetWorld(_simWorld);
+        _antView.SetWorldBounds(_simWorld.Config.Width, _simWorld.Config.Height);
         SelectHeatmapOnHost();
-        _simPanel.SetStatus(loaded is null
+        _simPanel.SetStatus((loaded is null
             ? "편집 월드를 복제해 새 실험을 시작했습니다."
-            : $"실험 상태를 불러왔습니다 (틱 {session.Tick}).");
+            : $"실험 상태를 불러왔습니다 (틱 {session.Tick}).") + SpawnText(spawn));
     }
 
     private void ExitSimulationMode()
@@ -115,6 +135,8 @@ public partial class Main
         _panel.Visible = true;
         _modeBar.SetMode(AppMode.Edit);
         _heatmap.HideHeatmap();
+        _antView.Clear();
+        ClearAntSelection();
         _view.SetWorld(_world);
         _panel.SetStatus("편집 모드. 시뮬레이션 결과는 원본 맵에 반영되지 않습니다.");
     }
@@ -143,7 +165,15 @@ public partial class Main
             if (_snapshot is not null) _host.Release(_snapshot);
             _snapshot = snapshot;
             _heatmapDirty = true;
+            // 보간 시작 시각은 (초기화 세대, 틱)이 바뀔 때만 갱신한다. 초기화 뒤 틱 0이 다시 와도 새 프레임으로 본다.
+            if (snapshot.Tick != _frameTick || snapshot.ResetCount != _frameResetCount)
+            {
+                _frameTick = snapshot.Tick;
+                _frameResetCount = snapshot.ResetCount;
+                _frameArrivalMs = Time.GetTicksMsec();
+            }
         }
+        UpdateAnts();
         if (_heatmapDirty)
         {
             _heatmapDirty = false;
@@ -156,12 +186,13 @@ public partial class Main
             $"틱 간격 {SimulationPanel.FormatNumber(_scentSettings.TickSeconds)}초 · 틱 계산 {_host.LastTickMilliseconds:0.0}ms" +
             (_heatmap.Visible ? $" · 히트맵 {_heatmap.LastRasterMilliseconds:0.0}ms" : ""));
 
+        string? antInfo = DescribeSelectedAnt();
         if (shown is not { } t)
         {
-            _simPanel.SetInfo("");
+            _simPanel.SetInfo(antInfo ?? "");
             return;
         }
-        string info = EditorText.DescribeTile(_simWorld, _view.Layer, t.X, t.Y);
+        string info = (antInfo is null ? "" : antInfo + "\n\n") + EditorText.DescribeTile(_simWorld, _view.Layer, t.X, t.Y);
         if (_snapshot is { } s && s.Layer == _view.Layer)
         {
             // 표시 색이 아니라 실제 농도 값을 보여 준다(복합 모드에서는 모든 냄새).
@@ -173,6 +204,96 @@ public partial class Main
         }
         _simPanel.SetInfo(info);
     }
+
+    /// <summary>개미를 그린다. 재생 중에는 마지막 틱 이후 경과 시간만큼 이전 → 현재 위치를 보간한다.</summary>
+    private void UpdateAnts()
+    {
+        if (_snapshot is not { } s || _host is null)
+        {
+            _antView.Clear();
+            return;
+        }
+        float alpha = 1;
+        if (_host.IsPlaying)
+        {
+            double tickMs = _scentSettings.TickSeconds / _host.Speed * 1000;
+            alpha = (float)Math.Clamp((Time.GetTicksMsec() - _frameArrivalMs) / tickMs, 0, 1);
+        }
+        if (_selectedAntId >= 0 && _selectedAntResetCount != s.ResetCount) ClearAntSelection();
+        _antView.ShowFrame(s.Ants, _view.Layer, alpha, _selectedAntId);
+        int surface = s.Ants.CountOn(LayerId.Surface);
+        _simPanel.SetAntCount($"개미 {s.Ants.Count}마리 (지상 {surface} / 개미집 {s.Ants.Count - surface}) · {EditorText.Name(_view.Layer)}에 표시 {_antView.VisibleCount}");
+    }
+
+    /// <summary>클릭 위치에서 가장 가까운 개미(현재 레이어, 1타일 이내)를 고른다. 없으면 false.</summary>
+    private bool TrySelectAnt(Vector2 worldPoint)
+    {
+        if (_snapshot is not { } s) return false;
+        var frame = s.Ants;
+        int best = -1;
+        float bestDistance = 1f;
+        for (int i = 0; i < frame.Count; i++)
+        {
+            if (frame.Layer[i] != (byte)_view.Layer) continue;
+            float d = new Vector2(frame.X[i], frame.Y[i]).DistanceTo(worldPoint);
+            if (d < bestDistance)
+            {
+                bestDistance = d;
+                best = i;
+            }
+        }
+        if (best >= 0) SelectAnt(frame.Id[best], s.ResetCount);
+        else ClearAntSelection();
+        return best >= 0;
+    }
+
+    private void SelectAnt(int id, long resetCount)
+    {
+        _selectedAntId = id;
+        _selectedAntResetCount = resetCount;
+    }
+
+    private void ClearAntSelection()
+    {
+        _selectedAntId = -1;
+        _selectedAntResetCount = -1;
+    }
+
+    private string? DescribeSelectedAnt()
+    {
+        if (_selectedAntId < 0 || _snapshot is not { } s || s.ResetCount != _selectedAntResetCount) return null;
+        var f = s.Ants;
+        int i = Array.IndexOf(f.Id, _selectedAntId, 0, f.Count);
+        if (i < 0) return $"개미 #{_selectedAntId}: 없음";
+        float degrees = f.Heading[i] * 180 / MathF.PI;
+        return $"개미 #{f.Id[i]} (일개미) · {EditorText.Name((LayerId)f.Layer[i])}\n" +
+               $"위치 ({f.X[i]:0.00}, {f.Y[i]:0.00}) · 방향 {degrees:0}°\n" +
+               $"기본 속도 {f.BaseSpeed[i]:0.00} 타일/초 · 현재 {f.BaseSpeed[i] * f.SpeedFactor[i]:0.00} (×{f.SpeedFactor[i]:0.00})\n" +
+               $"외형 크기 {f.Size[i]:0.00} 타일\n" +
+               "목표·행동·성향·기억: 단계 B~D에서 추가";
+    }
+
+    /// <summary>개미 설정을 적용한다: 그 설정으로 초기화(월드·냄새·틱·개미 재생성)하고 화면을 새 세대로 바꾼다.</summary>
+    private async Task ApplyAntSettings(AntSettings settings)
+    {
+        if (_host is null) return;
+        var errors = settings.Validate();
+        if (errors.Count > 0)
+        {
+            _simPanel.SetStatus(string.Join("\n", errors));
+            return;
+        }
+        var result = await ResetHost(settings, "개미 설정 적용");
+        if (result is null) return;
+        _antSettings = settings;
+        _simPanel.SetAntSettings(settings);
+        _simPanel.SetStatus("개미 설정을 적용하고 초기화했습니다." + SpawnText(result.Ants));
+    }
+
+    private static string SpawnText(AntSpawnReport report) =>
+        report.Requested == 0 ? " 개미 없음." :
+        report.Failed == 0 ? $" 개미 {report.Spawned}마리 생성." :
+        $" 개미 {report.Spawned}/{report.Requested}마리 생성(열린 공간 부족으로 {report.Failed}마리 실패).";
 
     private void UpdateHeatmap()
     {
@@ -261,6 +382,9 @@ public partial class Main
             case Key.Period:
                 _ = StepOnce();
                 return true;
+            case Key.S when key.CtrlPressed || key.MetaPressed:
+                QuickSaveExperiment();
+                return true;
             default:
                 return false;
         }
@@ -272,27 +396,51 @@ public partial class Main
         await RunHostCommand(_host, h => h.StepAsync(), "단일 틱");
     }
 
-    /// <summary>
-    /// 초기화. 계산 스레드가 같은 틱 경계에서 복제해 준 월드로 화면 월드(_simWorld)와 MapView를 바꾸고,
-    /// 초기화 이전 세대의 스냅샷을 버린다(F05: 시작 월드와 현재 월드가 다른 실험에서도 화면 = 계산).
-    /// </summary>
+    /// <summary>초기화(현재 개미 설정으로 재생성).</summary>
     private async Task ResetSimulation()
     {
-        if (_host is null) return;
+        var result = await ResetHost(null, "초기화");
+        if (result is not null) _simPanel.SetStatus("시작 상태로 초기화했습니다." + SpawnText(result.Ants));
+    }
+
+    /// <summary>
+    /// 초기화 버튼과 개미 설정 적용이 함께 쓰는 경로. 계산 스레드가 한 명령 안에서 월드·냄새·틱·개미·초기화 세대를 바꾸고
+    /// 같은 틱 경계에서 복제해 준 월드로 화면 월드(_simWorld)와 MapView를 바꾼다(F05). 이전 세대의 스냅샷(냄새·개미 프레임)은 버리고,
+    /// 개미 선택·보간 기준도 새 세대로 초기화한다. 그사이 호스트가 바뀌었거나(불러오기·모드 전환) 더 새로운 초기화가 이미 반영됐으면
+    /// 결과를 화면에 적용하지 않는다. 취소·실패면 null.
+    /// </summary>
+    private async Task<SimulationResetResult?> ResetHost(AntSettings? ants, string what)
+    {
+        if (_host is null) return null;
         var host = _host;
-        var result = await RunHostCommand(host, h => h.ResetAsync(), "초기화");
-        if (result is null || host != _host) return; // 취소됐거나 그사이 다른 세션으로 바뀜
+        SimulationResetResult? result;
+        try
+        {
+            result = await RunHostCommand(host, h => h.ResetAsync(ants), what);
+        }
+        catch (ArgumentException e)
+        {
+            if (host == _host) _simPanel.SetStatus($"{what} 실패: {e.Message}");
+            return null;
+        }
+        if (result is null || host != _host || result.ResetCount < _minResetCount) return null;
+
         _simWorld = result.World;
         _minResetCount = result.ResetCount;
         _view.SetWorld(_simWorld);
+        _antView.SetWorldBounds(_simWorld.Config.Width, _simWorld.Config.Height);
         if (_snapshot is not null && _snapshot.ResetCount < _minResetCount)
         {
             host.Release(_snapshot);
             _snapshot = null;
             _heatmap.HideHeatmap();
+            _antView.Clear();
+            // 보간 기준은 이전 세대 프레임을 버릴 때만 지운다. 결과보다 새 세대 스냅샷이 먼저 도착해 이미 표시 중이면 그 기준을 유지한다.
+            _frameTick = _frameResetCount = -1;
         }
+        ClearAntSelection();
         _heatmapDirty = true;
-        _simPanel.SetStatus("시작 상태로 초기화했습니다.");
+        return result;
     }
 
     /// <summary>
@@ -350,41 +498,70 @@ public partial class Main
         }
     }
 
+    /// <summary>
+    /// 실험 저장(대화상자·Ctrl+S 공용). 계산 스레드의 명령으로 틱 사이에 저장하며(<see cref="ExperimentSerializer"/>, v2, 임시 파일 교체),
+    /// 저장이 실제로 끝난 뒤에만 성공을 알린다. 성공한 경로는 이후 Ctrl+S 빠른 저장 대상이 된다.
+    /// </summary>
     private async Task SaveExperiment(string path)
     {
         if (_host is null) return;
         var host = _host;
         try
         {
-            long tick = await host.RunExclusiveAsync(session =>
+            await host.RunExclusiveAsync(session =>
             {
                 ExperimentSerializer.Save(session, path);
                 return session.Tick;
             });
-            string done = $"실험 상태 저장됨 (틱 {tick}): {path}";
-            if (host == _host) _simPanel.SetStatus(done);
-            else _panel.SetStatus(done);
+            if (host == _host) _experimentPath = path;
+            NotifySaved("실험", path, simulationPanel: host == _host);
         }
-        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException
+                                       or OperationCanceledException or ObjectDisposedException
+                                       or InvalidOperationException) // 계산 스레드 실패, 저장할 수 없는 상태(ValidateForSave)
         {
-            if (host == _host) _simPanel.SetStatus($"실험 저장 실패: {e.Message}");
-            else _panel.SetStatus($"실험 저장 실패: {e.Message}");
-        }
-        catch (Exception e) when (e is OperationCanceledException or ObjectDisposedException or InvalidOperationException)
-        {
-            ReportCommandStopped(host, "실험 저장", e); // 종료로 취소, 계산 스레드 실패, 저장 불가 상태(ValidateForSave)
+            NotifySaveFailed("실험", path, e, simulationPanel: host == _host);
         }
     }
+
+    /// <summary>
+    /// Ctrl+S(시뮬레이션 모드): 이 실험을 저장한 적이 있거나 v2 파일에서 불러왔으면 그 파일에 바로 저장, 아니면 저장 대화상자.
+    /// 맵 파일 경로(<see cref="_currentPath"/>)와는 따로 관리한다.
+    /// </summary>
+    private void QuickSaveExperiment()
+    {
+        if (_experimentPath is { } path) _ = SaveExperiment(path);
+        else ShowExperimentSaveDialog();
+    }
+
+    private void ShowExperimentSaveDialog() =>
+        ShowFileDialog(FileDialog.FileModeEnum.SaveFile, ExperimentFileFilter, path => _ = SaveExperiment(path));
 
     private void LoadExperiment(string path)
     {
         try
         {
-            StartSimulation(ExperimentSerializer.Load(path));
+            var loaded = ExperimentSerializer.Load(path);
+            var previous = _host;
+            StartSimulation(loaded);
+            if (_host is null || _host == previous) return;
+            // v2 파일이면 Ctrl+S가 그 파일에 저장한다. v1 파일은 저장 형식(v2)이 달라지므로 원본을 덮어쓰지 않도록 빠른 저장 대상으로 삼지 않는다.
+            bool v2 = ReadExperimentVersion(path) >= 2;
+            _experimentPath = v2 ? path : null;
+            if (!v2) _simPanel.SetStatus($"v1 실험 파일을 불러왔습니다(개미 없음). 저장하면 새 파일에 v2 형식으로 저장합니다. (틱 {loaded.Tick})");
         }
         catch (Exception e) when (e is MapFormatException or IOException or UnauthorizedAccessException)
         {
             _simPanel.SetStatus($"실험 불러오기 실패: {e.Message}");
         }
+    }
+
+    /// <summary>실험 파일 헤더의 형식 버전(magic 8바이트 다음 u16). 이미 정상으로 불러온 파일에만 쓴다.</summary>
+    private static int ReadExperimentVersion(string path)
+    {
+        Span<byte> header = stackalloc byte[10];
+        using var file = File.OpenRead(path);
+        file.ReadExactly(header);
+        return System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(header[8..]);
     }
 }
