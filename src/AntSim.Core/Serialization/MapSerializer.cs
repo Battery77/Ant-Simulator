@@ -25,6 +25,10 @@ public static class MapSerializer
     public const ushort CurrentVersion = 1;
     private static ReadOnlySpan<byte> Magic => "ANTMAP\0\0"u8;
 
+    /// <summary>이 월드를 맵 형식으로 저장했을 때의 바이트 수(헤더 25 + 평면 + 통로 + 체크섬).</summary>
+    public static long EncodedLength(World world) =>
+        25 + (long)World.LayerCount * TileEnums.PlaneCount * world.Config.TileCount + 4 + 4L * world.Passages.Count + 8;
+
     public static void Save(World world, Stream stream)
     {
         ArgumentNullException.ThrowIfNull(world);
@@ -71,9 +75,16 @@ public static class MapSerializer
         return Load(file, chunkSize);
     }
 
+    /// <summary>
+    /// 스트림의 현재 위치에서 맵 레코드 하나를 읽는다. 체크섬(레코드의 마지막 8바이트)을 읽은 직후 반환하며 그 뒤는 읽지 않으므로,
+    /// 같은 스트림에 이어진 다음 레코드를 다시 Load할 수 있다(seek 가능 여부와 무관). 형식 오류는 <see cref="MapFormatException"/>.
+    /// </summary>
     public static World Load(Stream stream, int chunkSize = WorldConfig.DefaultChunkSize)
     {
         ArgumentNullException.ThrowIfNull(stream);
+        // 크기 필드를 믿고 큰 배열을 먼저 만들지 않도록 매 단계 실제로 남은(seek 불가면 실제로 받은) 바이트와 비교한다(F01/E01).
+        // 레코드 하나만 읽고 체크섬 직후에서 멈춘다(끝까지 미리 읽지 않음, N01).
+        stream = StreamLimits.ForRecord(stream);
         var reader = new ChecksumReader(stream);
 
         Span<byte> magic = stackalloc byte[8];
@@ -103,6 +114,11 @@ public static class MapSerializer
         if (layerCount != World.LayerCount)
             throw new MapFormatException($"레이어 수가 잘못되었습니다: {layerCount}.");
 
+        // 월드·임시 평면을 만들기 전에, 헤더가 선언한 크기의 본문이 실제로 있는지 확인한다(E01).
+        // 최소 본문 = 레이어 × 평면 × 타일 + 통로 수(4) + 체크섬(8). long으로 계산해 넘침이 없다.
+        long minimumBody = (long)World.LayerCount * TileEnums.PlaneCount * config.TileCount + 4 + 8;
+        StreamLimits.Require(stream, minimumBody, "맵 본문");
+
         var world = new World(config, rules);
         int tiles = config.TileCount;
         var planes = new byte[TileEnums.PlaneCount][];
@@ -129,6 +145,7 @@ public static class MapSerializer
 
         int passageCount = reader.ReadInt32();
         if (passageCount < 0 || passageCount > tiles) throw new MapFormatException($"통로 수가 잘못되었습니다: {passageCount}.");
+        StreamLimits.Require(stream, 4L * passageCount + 8, "통로 목록");
         int previous = -1;
         for (int n = 0; n < passageCount; n++)
         {

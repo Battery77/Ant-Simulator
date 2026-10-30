@@ -1,3 +1,4 @@
+using System.Text;
 using AntSim.Core.Worlds;
 
 namespace AntSim.Core.Scent;
@@ -34,6 +35,19 @@ public sealed record ScentSettings
 {
     public const double DefaultTickSeconds = 0.1;
     public const double MaxTickSeconds = 10;
+
+    /// <summary>냄새 종류 수 상한. 실험 파일 형식이 읽을 수 있는 범위와 같다(저장 가능 = 불러오기 가능).</summary>
+    public const int MaxTypes = 256;
+
+    /// <summary>냄새 키·표시 이름의 UTF-8 바이트 길이 상한. 실험 파일의 문자열 읽기 상한과 같다.</summary>
+    public const int MaxNameUtf8Bytes = 65_536;
+
+    /// <summary>
+    /// 발생 계수 e(농도/초/개)의 상한. 이 값과 최대 틱(10초), 최대 수량(255)에서도 한 틱 발생량은 2.55e9로
+    /// float 범위 안이며, 감쇠 0으로 계속 쌓여도 <see cref="ScentState.MaxConcentration"/>(1e30)에 이르려면
+    /// 4e20틱 이상이 걸린다. UI 입력 상한(1000)보다 충분히 크다.
+    /// </summary>
+    public const double MaxEmission = 1e6;
 
     public static ScentSettings Default { get; } = new()
     {
@@ -72,12 +86,16 @@ public sealed record ScentSettings
         if (!double.IsFinite(TickSeconds) || TickSeconds <= 0 || TickSeconds > MaxTickSeconds)
             errors.Add($"틱 간격은 0초 초과 {MaxTickSeconds}초 이하여야 합니다 (현재 {TickSeconds}).");
         if (Types.Count == 0) errors.Add("냄새 종류가 하나 이상 있어야 합니다.");
+        if (Types.Count > MaxTypes) errors.Add($"냄새 종류는 최대 {MaxTypes}개입니다 (현재 {Types.Count}).");
 
         var keys = new HashSet<string>(StringComparer.Ordinal);
         foreach (var type in Types)
         {
             string name = string.IsNullOrWhiteSpace(type.DisplayName) ? type.Key : type.DisplayName;
+            if (name.Length > 40) name = name[..40] + "…";
             if (string.IsNullOrWhiteSpace(type.Key)) errors.Add("냄새 키가 비어 있습니다.");
+            if (Utf8Length(type.Key) > MaxNameUtf8Bytes) errors.Add($"냄새 키가 너무 깁니다(UTF-8 {MaxNameUtf8Bytes}바이트 초과).");
+            if (Utf8Length(type.DisplayName) > MaxNameUtf8Bytes) errors.Add($"냄새 표시 이름이 너무 깁니다(UTF-8 {MaxNameUtf8Bytes}바이트 초과).");
             else if (!keys.Add(type.Key)) errors.Add($"냄새 키 '{type.Key}'가 중복됩니다.");
             if (type.Source is { } source && !TileEnums.IsDefined(source)) errors.Add($"{name}: 발생원 종류가 잘못되었습니다.");
 
@@ -85,6 +103,7 @@ public sealed record ScentSettings
             CheckCoefficient(errors, name, "통로 확산 계수", type.PassageDiffusion);
             CheckCoefficient(errors, name, "감쇠 계수", type.Decay);
             CheckCoefficient(errors, name, "발생 계수", type.Emission);
+            if (type.Emission > MaxEmission) errors.Add($"{name}: 발생 계수는 {MaxEmission:0.#e+0} 이하여야 합니다 (현재 {type.Emission}).");
 
             if (double.IsFinite(TickSeconds) && TickSeconds > 0)
             {
@@ -101,6 +120,8 @@ public sealed record ScentSettings
     /// <summary>냄새 종류 구성(키 순서)이 같은지. 실행 중에는 계수만 바꿀 수 있다.</summary>
     public bool HasSameTypesAs(ScentSettings other) =>
         Types.Count == other.Types.Count && Types.Select(t => t.Key).SequenceEqual(other.Types.Select(t => t.Key));
+
+    private static int Utf8Length(string? text) => text is null ? 0 : Encoding.UTF8.GetByteCount(text);
 
     private static void CheckCoefficient(List<string> errors, string name, string label, double value)
     {

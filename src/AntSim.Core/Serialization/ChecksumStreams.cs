@@ -73,7 +73,10 @@ internal sealed class ChecksumWriter(Stream stream)
 /// <summary>읽는 모든 바이트의 체크섬을 함께 계산하는 리틀 엔디언 판독기. 파일이 짧으면 <see cref="MapFormatException"/>.</summary>
 internal sealed class ChecksumReader(Stream stream)
 {
-    public const int MaxStringBytes = 1 << 16;
+    /// <summary>문자열 UTF-8 바이트 상한. 저장 쪽 검증(<see cref="Scent.ScentSettings.MaxNameUtf8Bytes"/>)과 같은 값이다.</summary>
+    public const int MaxStringBytes = Scent.ScentSettings.MaxNameUtf8Bytes;
+
+    public Stream BaseStream => stream;
 
     private Fnv1a64 _hash = Fnv1a64.Create();
 
@@ -143,6 +146,7 @@ internal sealed class ChecksumReader(Stream stream)
     {
         int length = ReadInt32();
         if (length < 0 || length > MaxStringBytes) throw new MapFormatException($"문자열 길이가 잘못되었습니다: {length}.");
+        StreamLimits.Require(stream, length, "문자열");
         var bytes = new byte[length];
         Read(bytes);
         return Encoding.UTF8.GetString(bytes);

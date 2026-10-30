@@ -34,12 +34,23 @@ public static class HeatmapRasterizer
         return max;
     }
 
-    /// <summary>농도를 0~1로 정규화한다. 최대값이 0 이하이면 0.</summary>
+    /// <summary>농도를 0~1로 정규화한다. 최대값이 0 이하이면 0. 로그는 log(1+x)를 아주 작은 x에서도 정확하게 계산한다.</summary>
     public static float Normalize(float value, float max, HeatmapScale scale)
     {
         if (!(value > 0) || !(max > 0)) return 0;
-        float t = scale == HeatmapScale.Log ? MathF.Log(1 + value) / MathF.Log(1 + max) : value / max;
-        return Math.Clamp(t, 0f, 1f);
+        double t = scale == HeatmapScale.Log ? Log1P(value) / Log1P(max) : (double)value / max;
+        return double.IsNaN(t) ? 1f : (float)Math.Clamp(t, 0.0, 1.0); // NaN은 value, max가 모두 +∞일 때만 생긴다
+    }
+
+    /// <summary>
+    /// log(1 + x) (x ≥ 0). float로 1 + x를 계산하면 x가 작을 때 1로 반올림되어 0이 되므로(0/0 = NaN의 원인),
+    /// double에서 보정식 log(u)·x/(u−1) (u = 1 + x)을 쓴다. u가 1로 반올림될 만큼 작으면 log(1+x) ≈ x.
+    /// </summary>
+    internal static double Log1P(double x)
+    {
+        if (double.IsPositiveInfinity(x)) return x;
+        double u = 1.0 + x;
+        return u == 1.0 ? x : Math.Log(u) * x / (u - 1.0);
     }
 
     public static uint Color(float t)
@@ -100,13 +111,17 @@ public static class HeatmapRasterizer
 /// </summary>
 public readonly struct HeatmapQuantizer
 {
-    private readonly float _factor;
+    private readonly float _factor;     // 선형: 255 / max (float, 기존 계산 그대로)
+    private readonly double _logFactor; // 로그: 255 / log1p(max) (double: 작은 max에서도 유한)
     private readonly bool _log;
 
     public HeatmapQuantizer(float max, HeatmapScale scale)
     {
         _log = scale == HeatmapScale.Log;
-        _factor = !(max > 0) || float.IsInfinity(max) ? 0 : _log ? 255f / MathF.Log(1 + max) : 255f / max;
+        bool usable = max > 0 && !float.IsInfinity(max);
+        _factor = usable && !_log ? 255f / max : 0;
+        _logFactor = usable && _log ? 255.0 / HeatmapRasterizer.Log1P(max) : 0;
+        if (_log && usable) _factor = 1; // IsEmpty 판정용 표식(로그 계산에는 쓰지 않음)
     }
 
     /// <summary>표시할 수 없는 최대값(0 이하)이면 true. 이 채널은 아무 칸에도 기여하지 않는다.</summary>
@@ -116,7 +131,13 @@ public readonly struct HeatmapQuantizer
     public int Quantize(float value)
     {
         if (!(value > 0) || _factor == 0) return 0;
-        float x = (_log ? MathF.Log(1 + value) : value) * _factor + 0.5f;
+        if (_log)
+        {
+            // value = max → 정확히 255.5 근처 → 255. 0 < value < max → 1~255. 비유한 값은 정수 변환에 넘기지 않는다.
+            double y = HeatmapRasterizer.Log1P(value) * _logFactor + 0.5;
+            return !(y < 255) ? 255 : y < 1 ? 1 : (int)y;
+        }
+        float x = value * _factor + 0.5f;
         return x >= 255 ? 255 : x < 1 ? 1 : (int)x;
     }
 

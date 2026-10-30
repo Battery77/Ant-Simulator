@@ -73,6 +73,9 @@ public sealed class SimulationSession
     public AntSpawnReport LastSpawn { get; private set; }
     public long Tick { get; private set; }
 
+    /// <summary>초기화 횟수(초기화 세대). 스냅샷에 함께 실려, 초기화 이전에 만든 화면 데이터를 구분하는 데 쓴다.</summary>
+    public long ResetCount { get; private set; }
+
     /// <summary>시뮬레이션 시간(초). 틱 간격이 실행 중 바뀔 수 있으므로 누적한다.</summary>
     public double ElapsedSeconds { get; private set; }
 
@@ -105,6 +108,7 @@ public sealed class SimulationSession
         Scent.Clear();
         Tick = 0;
         ElapsedSeconds = 0;
+        ResetCount++;
     }
 
     /// <summary>

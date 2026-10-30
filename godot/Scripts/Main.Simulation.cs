@@ -38,6 +38,9 @@ public partial class Main
     private double _speed = 1;
     private bool _heatmapDirty;
 
+    /// <summary>화면이 받아들일 최소 초기화 세대. 이보다 이전 세대의 스냅샷은 초기화 전 상태라 버린다(F05).</summary>
+    private long _minResetCount;
+
     /// <summary>화면에 표시 중인 월드(편집 원본 또는 시뮬레이션 표시용 복제본).</summary>
     private World CurrentWorld => _mode == AppMode.Simulation && _simWorld is not null ? _simWorld : _world;
 
@@ -95,6 +98,7 @@ public partial class Main
         _antSettings = session.AntSettings;
         var spawn = session.LastSpawn;
         _simWorld = session.World.Clone();
+        _minResetCount = session.ResetCount;
         _host = new SimulationHost(session) { Speed = _speed };
         _mode = AppMode.Simulation;
         _pinnedTile = null;
@@ -144,7 +148,12 @@ public partial class Main
         if (_host is null || _simWorld is null) return;
         if (_host.Failure is { } failure) _simPanel.SetStatus($"계산 오류로 중지됨: {failure.Message}");
 
-        if (_host.TryTakeSnapshot(out var snapshot))
+        if (_host.TryTakeSnapshot(out var snapshot) && snapshot.ResetCount < _minResetCount)
+        {
+            _host.Release(snapshot); // 초기화 이전에 만든 화면 데이터: 새 월드 위에 그리지 않는다
+            snapshot = null!;
+        }
+        if (snapshot is not null)
         {
             if (_snapshot is not null) _host.Release(_snapshot);
             _snapshot = snapshot;
@@ -251,12 +260,12 @@ public partial class Main
             return;
         }
         var host = _host;
-        var report = await host.ResetAsync(settings);
+        var result = await host.ResetAsync(settings);
         if (host != _host) return;
         _antSettings = settings;
         _simPanel.SetAntSettings(settings);
         _selectedAntId = -1;
-        _simPanel.SetStatus("개미 설정을 적용하고 초기화했습니다." + SpawnText(report));
+        _simPanel.SetStatus("개미 설정을 적용하고 초기화했습니다." + SpawnText(result.Ants));
     }
 
     private static string SpawnText(AntSpawnReport report) =>
@@ -359,22 +368,76 @@ public partial class Main
     private async Task StepOnce()
     {
         if (_host is null) return;
-        await _host.StepAsync();
+        await RunHostCommand(_host, h => h.StepAsync(), "단일 틱");
     }
 
+    /// <summary>
+    /// 초기화. 계산 스레드가 같은 틱 경계에서 복제해 준 월드로 화면 월드(_simWorld)와 MapView를 바꾸고,
+    /// 초기화 이전 세대의 스냅샷을 버린다(F05: 시작 월드와 현재 월드가 다른 실험에서도 화면 = 계산).
+    /// </summary>
     private async Task ResetSimulation()
     {
         if (_host is null) return;
-        await _host.ResetAsync();
+        var host = _host;
+        var result = await RunHostCommand(host, h => h.ResetAsync(), "초기화");
+        if (result is null || host != _host) return; // 취소됐거나 그사이 다른 세션으로 바뀜
+        _simWorld = result.World;
+        _minResetCount = result.ResetCount;
+        _view.SetWorld(_simWorld);
+        if (_snapshot is not null && _snapshot.ResetCount < _minResetCount)
+        {
+            host.Release(_snapshot);
+            _snapshot = null;
+            _heatmap.HideHeatmap();
+        }
+        _heatmapDirty = true;
         _simPanel.SetStatus("시작 상태로 초기화했습니다.");
+    }
+
+    /// <summary>
+    /// 호스트 명령을 기다린다. 호스트가 종료(모드 전환)되어 취소되거나 계산 스레드 실패로 거부되면
+    /// 예외를 밖으로 던지지 않고 상태 문구만 남긴다. 성공하면 결과, 아니면 null.
+    /// </summary>
+    private async Task<T?> RunHostCommand<T>(SimulationHost host, Func<SimulationHost, Task<T>> command, string what) where T : class
+    {
+        try
+        {
+            return await command(host);
+        }
+        catch (Exception e) when (e is OperationCanceledException or ObjectDisposedException or InvalidOperationException)
+        {
+            ReportCommandStopped(host, what, e);
+            return null;
+        }
+    }
+
+    private async Task RunHostCommand(SimulationHost host, Func<SimulationHost, Task> command, string what)
+    {
+        try
+        {
+            await command(host);
+        }
+        catch (Exception e) when (e is OperationCanceledException or ObjectDisposedException or InvalidOperationException)
+        {
+            ReportCommandStopped(host, what, e);
+        }
+    }
+
+    private void ReportCommandStopped(SimulationHost host, string what, Exception e)
+    {
+        string message = e is OperationCanceledException or ObjectDisposedException
+            ? $"{what} 요청이 취소되었습니다(시뮬레이션 종료)."
+            : $"{what} 요청을 실행하지 못했습니다: {e.Message}";
+        if (host == _host) _simPanel.SetStatus(message);
+        else _panel.SetStatus(message); // 이미 편집 모드로 나간 경우
     }
 
     private async Task ApplySettings(ScentSettings settings)
     {
         if (_host is null) return;
         var host = _host;
-        var errors = await host.SetSettingsAsync(settings);
-        if (host != _host) return;
+        var errors = await RunHostCommand(host, h => h.SetSettingsAsync(settings), "설정 적용");
+        if (errors is null || host != _host) return;
         if (errors.Count == 0)
         {
             _scentSettings = settings;
@@ -389,18 +452,26 @@ public partial class Main
     private async Task SaveExperiment(string path)
     {
         if (_host is null) return;
+        var host = _host;
         try
         {
-            long tick = await _host.RunExclusiveAsync(session =>
+            long tick = await host.RunExclusiveAsync(session =>
             {
                 ExperimentSerializer.Save(session, path);
                 return session.Tick;
             });
-            _simPanel.SetStatus($"실험 상태 저장됨 (틱 {tick}): {path}");
+            string done = $"실험 상태 저장됨 (틱 {tick}): {path}";
+            if (host == _host) _simPanel.SetStatus(done);
+            else _panel.SetStatus(done);
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
         {
-            _simPanel.SetStatus($"실험 저장 실패: {e.Message}");
+            if (host == _host) _simPanel.SetStatus($"실험 저장 실패: {e.Message}");
+            else _panel.SetStatus($"실험 저장 실패: {e.Message}");
+        }
+        catch (Exception e) when (e is OperationCanceledException or ObjectDisposedException or InvalidOperationException)
+        {
+            ReportCommandStopped(host, "실험 저장", e); // 종료로 취소, 계산 스레드 실패, 저장 불가 상태(ValidateForSave)
         }
     }
 

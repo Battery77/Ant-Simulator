@@ -9,7 +9,8 @@ namespace AntSim.Core.Serialization;
 /// <summary>
 /// 시뮬레이션 실험 상태 파일(.antexp). 맵 파일(.antmap)과 분리되어 있으며, 실험을 그대로 이어서 실행할 수 있도록
 /// 설정·틱·시작 월드·현재 월드·냄새 필드 전체를 담는다. 모든 정수·실수는 리틀 엔디언.
-/// v2는 v1 끝(냄새 다음, 체크섬 앞)에 개미 설정과 개체 상태를 추가했다. v1 파일은 개미 없이 불러온다.
+/// v2는 v1 끝(냄새 다음, 체크섬 앞)에 개미 설정과 개체 상태를 추가했다. v1 파일은 월드·냄새·틱·경과 시간을 그대로 두고
+/// 개미 0마리(<see cref="AntSettings.None"/>)로 불러온다. 저장은 항상 v2다.
 /// <code>
 /// [v1]
 /// magic        8 bytes  "ANTEXP\0\0"
@@ -36,8 +37,11 @@ namespace AntSim.Core.Serialization;
 /// </summary>
 public static class ExperimentSerializer
 {
+    /// <summary>저장 형식 버전. 저장은 항상 이 버전(v2)으로 하고, 불러오기는 v1(개미 구간 없음)과 v2를 모두 지원한다.</summary>
     public const ushort CurrentVersion = 2;
-    public const int MaxScentTypes = 256;
+
+    /// <summary>냄새 종류 수 상한(<see cref="ScentSettings.MaxTypes"/>와 같다: 저장할 수 있으면 불러올 수 있다).</summary>
+    public const int MaxScentTypes = ScentSettings.MaxTypes;
     private static ReadOnlySpan<byte> Magic => "ANTEXP\0\0"u8;
 
     public static void Save(SimulationSession session, Stream stream)
@@ -45,6 +49,7 @@ public static class ExperimentSerializer
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(stream);
         EnsureLittleEndian();
+        ValidateForSave(session);
         var writer = new ChecksumWriter(stream);
 
         writer.Write(Magic);
@@ -82,9 +87,42 @@ public static class ExperimentSerializer
 
     public static void Save(SimulationSession session, string path)
     {
+        ArgumentNullException.ThrowIfNull(session);
+        // 저장할 수 없는 상태는 임시 파일을 만들기 전에 거부한다(기존 파일 보존).
+        ValidateForSave(session);
         string temp = path + ".tmp";
-        using (var file = File.Create(temp)) Save(session, file);
-        File.Move(temp, path, overwrite: true);
+        try
+        {
+            using (var file = File.Create(temp)) Save(session, file);
+            File.Move(temp, path, overwrite: true);
+        }
+        catch
+        {
+            File.Delete(temp);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// 저장하면 같은 구현으로 다시 불러올 수 있는 상태인지 쓰기 전에 검사한다. 불가능하면 <see cref="InvalidOperationException"/>.
+    /// (설정: <see cref="ScentSettings.Validate"/> — 종류 수·문자열 길이·계수 범위, 농도: 0 ~ <see cref="ScentState.MaxConcentration"/>,
+    /// 월드: 내장 맵 길이가 int 범위)
+    /// </summary>
+    public static void ValidateForSave(SimulationSession session)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        var errors = session.Settings.Validate();
+        if (errors.Count > 0)
+            throw new InvalidOperationException($"저장할 수 없는 설정입니다: {string.Join(" ", errors)}");
+        if (!session.Scent.AllValuesInSupportedRange())
+            throw new InvalidOperationException(
+                $"저장할 수 없는 냄새 농도가 있습니다(음수·NaN·무한대 또는 {ScentState.MaxConcentration:0e0} 초과).");
+        foreach (var world in new[] { session.InitialWorld, session.World })
+        {
+            long mapBytes = MapSerializer.EncodedLength(world);
+            if (mapBytes > int.MaxValue)
+                throw new InvalidOperationException($"월드가 너무 커서 실험 파일에 담을 수 없습니다({mapBytes}바이트).");
+        }
     }
 
     public static SimulationSession Load(string path)
@@ -93,10 +131,17 @@ public static class ExperimentSerializer
         return Load(file);
     }
 
+    /// <summary>
+    /// 스트림의 현재 위치에서 실험 상태 레코드 하나를 읽는다. 체크섬(레코드의 마지막 8바이트)을 읽은 직후 반환하며 그 뒤는 읽지 않으므로,
+    /// 같은 스트림에 이어진 다음 레코드를 다시 Load할 수 있다(seek 가능 여부와 무관). 형식 오류는 <see cref="MapFormatException"/>.
+    /// </summary>
     public static SimulationSession Load(Stream stream)
     {
         ArgumentNullException.ThrowIfNull(stream);
         EnsureLittleEndian();
+        // 크기 필드를 믿고 큰 배열을 먼저 만들지 않도록 매 단계 실제로 남은(seek 불가면 실제로 받은) 바이트와 비교한다(F01/E01).
+        // 레코드 하나만 읽고 체크섬 직후에서 멈춘다(끝까지 미리 읽지 않음, N01).
+        stream = StreamLimits.ForRecord(stream);
         var reader = new ChecksumReader(stream);
 
         Span<byte> magic = stackalloc byte[8];
@@ -117,6 +162,8 @@ public static class ExperimentSerializer
         double tickSeconds = reader.ReadDouble();
         int typeCount = reader.ReadInt32();
         if (typeCount < 1 || typeCount > MaxScentTypes) throw new MapFormatException($"냄새 종류 수가 잘못되었습니다: {typeCount}.");
+        // 종류마다 최소 문자열 길이 2×4 + 발생원 2 + 계수 4×8 = 42바이트.
+        StreamLimits.Require(stream, 42L * typeCount, "냄새 설정");
         var types = new ScentTypeSettings[typeCount];
         for (int i = 0; i < typeCount; i++)
         {
@@ -136,6 +183,10 @@ public static class ExperimentSerializer
         if (initial.Config.Width != current.Config.Width || initial.Config.Height != current.Config.Height)
             throw new MapFormatException("시작 월드와 현재 월드의 크기가 다릅니다.");
 
+        // 냄새 배열(Current/Next)을 만들기 전에 농도 본문 전체가 실제로 있는지 확인한다.
+        // 종류 ≤ 256, 타일 ≤ 2^28이므로 long 곱은 넘치지 않는다.
+        long scentBytes = (long)typeCount * World.LayerCount * current.Config.TileCount * sizeof(float);
+        StreamLimits.Require(stream, scentBytes + 8, "냄새 농도");
         var scent = new ScentState(current.Config, typeCount);
         for (int t = 0; t < typeCount; t++)
         for (int l = 0; l < World.LayerCount; l++)
@@ -143,7 +194,8 @@ public static class ExperimentSerializer
             var field = scent.MutableField(t, (LayerId)l);
             reader.Read(MemoryMarshal.AsBytes(field));
             foreach (float v in field)
-                if (!float.IsFinite(v) || v < 0) throw new MapFormatException("냄새 농도에 잘못된 값(음수 또는 NaN)이 있습니다.");
+                if (!(v >= 0 && v <= ScentState.MaxConcentration))
+                    throw new MapFormatException($"냄새 농도에 지원 범위(0 ~ {ScentState.MaxConcentration:0e0}) 밖의 값(음수·NaN·무한대 포함)이 있습니다.");
         }
 
         var antSettings = AntSettings.None;
@@ -256,13 +308,20 @@ public static class ExperimentSerializer
         writer.Write(buffer.GetBuffer().AsSpan(0, (int)buffer.Length));
     }
 
+    /// <summary>
+    /// 내장 맵을 읽는다. 선언된 길이를 남은 파일 길이로 먼저 검증하고, 바이트 배열로 통째로 복사하지 않고
+    /// 그 구간만 읽는 스트림으로 맵 로더에 넘긴다(맵 로더도 본문 크기를 할당 전에 검증한다).
+    /// </summary>
     private static World ReadWorld(ChecksumReader reader)
     {
         int length = reader.ReadInt32();
         if (length <= 0) throw new MapFormatException($"월드 데이터 길이가 잘못되었습니다: {length}.");
-        var bytes = new byte[length];
-        reader.Read(bytes);
-        return MapSerializer.Load(new MemoryStream(bytes, writable: false));
+        StreamLimits.Require(reader.BaseStream, length, "내장 월드");
+        var section = new ChecksumSectionStream(reader, length);
+        var world = MapSerializer.Load(section);
+        if (section.Remaining != 0)
+            throw new MapFormatException($"내장 월드 길이가 맵 데이터와 맞지 않습니다(남은 {section.Remaining}바이트).");
+        return world;
     }
 
     private static void EnsureLittleEndian()

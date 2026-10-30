@@ -10,6 +10,23 @@ namespace AntSim.Core.Scent;
 /// </summary>
 public sealed class ScentState
 {
+    /// <summary>
+    /// 지원하는 농도 상한. 이 범위(0 ~ 1e30)에서는 네 이웃 차이의 합(최대 4e30)과 감쇠·발생이 float에서 넘치지 않는다.
+    /// 실험 파일 저장·불러오기는 이 범위 밖(음수, NaN, ∞, 1e30 초과)의 농도를 거부한다.
+    /// <see cref="MutableField"/>로 범위 밖 값을 직접 넣는 것은 지원하지 않는다.
+    /// </summary>
+    public const float MaxConcentration = 1e30f;
+
+    /// <summary>모든 필드의 값이 지원 범위(0 ~ <see cref="MaxConcentration"/>, 유한)인지. 저장 전 검사용.</summary>
+    public bool AllValuesInSupportedRange()
+    {
+        foreach (var type in _current)
+        foreach (var field in type)
+            foreach (float v in field)
+                if (!(v >= 0 && v <= MaxConcentration)) return false; // NaN도 여기서 걸린다
+        return true;
+    }
+
     private float[][][] _current;
     private float[][][] _next;
 

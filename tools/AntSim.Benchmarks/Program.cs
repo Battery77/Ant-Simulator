@@ -115,6 +115,7 @@ var scentWorld = WorldPresets.StandardNest(config);
     for (int i = 0; i < 2000; i++) editor.Apply(EditOp.AddPassage(2 + (i * 37) % (size - 4), 2 + (i * 91) % (size - 4)));
     for (int i = 0; i < 5000; i++) editor.Apply(EditOp.SetQuantity(LayerId.Surface, (i * 13) % size, (i * 29) % size, QuantityKind.Food, 5));
 }
+PrintWorkload(scentWorld);
 var scentSession = new SimulationSession(scentWorld, ScentSettings.Default);
 scentSession.Step(5);
 double tickMs = Measure("냄새 1틱 (2종 × 2레이어)", () => scentSession.Step(), config.TileCount * 4L);
@@ -170,6 +171,27 @@ foreach (int antCount in new[] { 100, 1000, 5000, 10000, 20000 })
 
 Console.WriteLine();
 Console.WriteLine($"(sink {sink & 1})");
+
+// 측정 입력의 실제 구성(반복 횟수가 아니라 고유 좌표 기준)을 출력한다. 이 수치는 이 입력의 조건일 뿐,
+// 모든 월드 구성을 대표하지 않는다(대부분 고체인 개미집, 희소한 발생원, 유충 발생원 없음).
+static void PrintWorkload(World world)
+{
+    int tiles = world.Config.TileCount;
+    Console.WriteLine($"  [냄새 측정 입력] 고유 통로 {world.Passages.Count}개");
+    foreach (var layer in world.Layers)
+    {
+        int open = 0, food = 0, larva = 0;
+        for (int y = 0; y < world.Config.Height; y++)
+        for (int x = 0; x < world.Config.Width; x++)
+        {
+            var state = layer.GetState(x, y);
+            if (!state.HasSolid) open++;
+            if (state.Food > 0) food++;
+            if (state.Larva > 0) larva++;
+        }
+        Console.WriteLine($"  [냄새 측정 입력] {layer.Id}: 열린 칸 {open}/{tiles} ({100.0 * open / tiles:0.####}%), 먹이 발생원 {food}칸, 유충 발생원 {larva}칸");
+    }
+}
 
 double Measure(string name, Action action, long elements)
 {

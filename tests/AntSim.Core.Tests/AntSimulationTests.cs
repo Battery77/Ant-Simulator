@@ -188,10 +188,14 @@ public class AntSimulationTests
     {
         using var host = new SimulationHost(NewSession());
         await host.StepAsync().WaitAsync(Timeout);
-        var report = await host.ResetAsync(Ants with { InitialCount = 25 }).WaitAsync(Timeout);
-        Assert.Equal(new AntSpawnReport(25, 25), report);
+        var result = await host.ResetAsync(Ants with { InitialCount = 25 }).WaitAsync(Timeout);
+        Assert.Equal(new AntSpawnReport(25, 25), result.Ants);
+        Assert.Equal(1, result.ResetCount);
+        Assert.Equal(0, result.Tick);
         Assert.Equal(0, host.Tick);
-        Assert.Equal(25, await host.RunExclusiveAsync(s => s.Ants.Count).WaitAsync(Timeout));
+        var (count, worldHash) = await host.RunExclusiveAsync(s => (s.Ants.Count, s.World.ComputeContentHash())).WaitAsync(Timeout);
+        Assert.Equal(25, count);
+        Assert.Equal(worldHash, result.World.ComputeContentHash());
     }
 
     [Fact]
