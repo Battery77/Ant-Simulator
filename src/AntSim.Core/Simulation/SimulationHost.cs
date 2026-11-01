@@ -23,6 +23,35 @@ public sealed class AntFrame
     public float[] BaseSpeed { get; private set; } = Array.Empty<float>();
     public float[] SpeedFactor { get; private set; } = Array.Empty<float>();
 
+    /// <summary>
+    /// 화면에 그리는 위치: 이전 틱 → 현재 틱을 <paramref name="alpha"/>(0~1)로 보간한다. 화면 표시(AntView)와 클릭 선택이
+    /// 같은 식을 써서, 보이는 위치와 선택 기준이 비트 단위로 같다(감사 SA05).
+    /// </summary>
+    public (float X, float Y) DisplayPosition(int index, float alpha) =>
+        (PrevX[index] + (X[index] - PrevX[index]) * alpha, PrevY[index] + (Y[index] - PrevY[index]) * alpha);
+
+    /// <summary>
+    /// <paramref name="layer"/>의 개미 중 표시 위치(<see cref="DisplayPosition"/>)가 (x, y)에서 <paramref name="maxDistance"/> 미만으로 가장 가까운
+    /// 개미의 인덱스. 없으면 -1. 거리가 같으면 앞 인덱스.
+    /// </summary>
+    public int FindNearestShown(LayerId layer, float alpha, float x, float y, float maxDistance)
+    {
+        int best = -1;
+        float bestSquared = maxDistance * maxDistance;
+        for (int i = 0; i < Count; i++)
+        {
+            if (Layer[i] != (byte)layer) continue;
+            var (sx, sy) = DisplayPosition(i, alpha);
+            float dx = sx - x, dy = sy - y, squared = dx * dx + dy * dy;
+            if (squared < bestSquared)
+            {
+                bestSquared = squared;
+                best = i;
+            }
+        }
+        return best;
+    }
+
     /// <summary>레이어별 개미 수.</summary>
     public int CountOn(LayerId layer)
     {
@@ -30,6 +59,15 @@ public sealed class AntFrame
         for (int i = 0; i < Count; i++)
             if (Layer[i] == (byte)layer) n++;
         return n;
+    }
+
+    /// <summary>테스트용: 지정한 값으로 채운다.</summary>
+    internal void SetForTest(int[] id, byte[] layer, float[] prevX, float[] prevY, float[] x, float[] y)
+    {
+        int n = id.Length;
+        Id = id; Layer = layer; PrevX = prevX; PrevY = prevY; X = x; Y = y;
+        Heading = new float[n]; Size = new float[n]; BaseSpeed = new float[n]; SpeedFactor = new float[n];
+        Count = n;
     }
 
     internal void Fill(AntPopulation ants)

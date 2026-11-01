@@ -25,6 +25,9 @@ public partial class Main
     private long _selectedAntResetCount = -1; // 선택한 개미의 초기화 세대(초기화 뒤 같은 ID의 다른 개미를 가리키지 않도록)
     private long _frameTick = -1;
     private long _frameResetCount = -1;
+
+    /// <summary>마지막으로 그린 개미 프레임의 보간 계수(클릭 선택이 화면에 보인 위치를 쓰도록).</summary>
+    private float _antAlpha = 1;
     private ulong _frameArrivalMs;
 
     /// <summary>실험 빠른 저장(Ctrl+S) 대상. 새 실험·v1 파일이면 없음(저장 대화상자를 연다).</summary>
@@ -220,28 +223,22 @@ public partial class Main
             alpha = (float)Math.Clamp((Time.GetTicksMsec() - _frameArrivalMs) / tickMs, 0, 1);
         }
         if (_selectedAntId >= 0 && _selectedAntResetCount != s.ResetCount) ClearAntSelection();
+        _antAlpha = alpha;
         _antView.ShowFrame(s.Ants, _view.Layer, alpha, _selectedAntId);
         int surface = s.Ants.CountOn(LayerId.Surface);
         _simPanel.SetAntCount($"개미 {s.Ants.Count}마리 (지상 {surface} / 개미집 {s.Ants.Count - surface}) · {EditorText.Name(_view.Layer)}에 표시 {_antView.VisibleCount}");
     }
 
-    /// <summary>클릭 위치에서 가장 가까운 개미(현재 레이어, 1타일 이내)를 고른다. 없으면 false.</summary>
+    /// <summary>
+    /// 클릭 위치에서 가장 가까운 개미(보는 레이어, 1타일 이내)를 고른다. 없으면 false.
+    /// 거리는 마지막으로 화면에 그린 위치(같은 스냅샷, 같은 보간 계수)로 잰다(감사 SA05: 이전에는 현재 틱 좌표를 써서 보이는 개미와 다른 개미가 골라질 수 있었다).
+    /// 스냅샷은 화면이 소유한 복사본이며 계산 스레드의 배열을 읽지 않는다.
+    /// </summary>
     private bool TrySelectAnt(Vector2 worldPoint)
     {
         if (_snapshot is not { } s) return false;
         var frame = s.Ants;
-        int best = -1;
-        float bestDistance = 1f;
-        for (int i = 0; i < frame.Count; i++)
-        {
-            if (frame.Layer[i] != (byte)_view.Layer) continue;
-            float d = new Vector2(frame.X[i], frame.Y[i]).DistanceTo(worldPoint);
-            if (d < bestDistance)
-            {
-                bestDistance = d;
-                best = i;
-            }
-        }
+        int best = frame.FindNearestShown(_view.Layer, _antAlpha, worldPoint.X, worldPoint.Y, 1f);
         if (best >= 0) SelectAnt(frame.Id[best], s.ResetCount);
         else ClearAntSelection();
         return best >= 0;

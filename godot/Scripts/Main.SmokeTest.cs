@@ -160,6 +160,7 @@ public partial class Main
         await SmokeAuditFixes(check);
         await SmokeSimulationLayerSwitch(check);
         await SmokeStageAResetIntegration(check);
+        await SmokeSelectionMatchesDrawnPosition(check);
         if (HasDisplay) await SmokeNumberFieldFocus(check);
         await SmokeExperimentSaveUx(check);
 
@@ -434,6 +435,40 @@ public partial class Main
         check(_minResetCount == 0, $"새 호스트의 세대 기준 유지 ({_minResetCount})");
         await WaitUntil(() => _snapshot is { } s && s.Ants.Count == 77, "불러온 실험의 개미 프레임");
         System.IO.File.Delete(path);
+    }
+
+    /// <summary>
+    /// 감사 SA05: 재생 중(보간 중) 화면에 그린 위치를 누르면 그 개미가 선택된다. 같은 프레임 안에서(대기 없이) 그린 위치를 읽고 선택한다.
+    /// </summary>
+    private async Task SmokeSelectionMatchesDrawnPosition(Action<bool, string> check)
+    {
+        var host = _host!;
+        host.Speed = 2;
+        host.Play();
+        int interpolated = 0, matched = 0, tried = 0;
+        for (int frameNo = 0; frameNo < 60 && tried < 20; frameNo++)
+        {
+            await NextFrame();
+            if (_snapshot is not { } s || _antAlpha >= 1) continue;
+            interpolated++;
+            var f = s.Ants;
+            for (int i = 0; i < f.Count; i++)
+            {
+                if (f.Layer[i] != (byte)_view.Layer || f.X[i] == f.PrevX[i]) continue;
+                var (x, y) = f.DisplayPosition(i, _antAlpha);
+                tried++;
+                if (TrySelectAnt(new Vector2(x, y)))
+                {
+                    int picked = Array.IndexOf(f.Id, _selectedAntId, 0, f.Count);
+                    if (picked >= 0 && f.DisplayPosition(picked, _antAlpha) == (x, y)) matched++;
+                }
+                break;
+            }
+        }
+        host.Pause();
+        check(interpolated > 0, "재생 중 보간 프레임(alpha < 1)을 관찰함");
+        check(tried > 0 && matched == tried, $"그린 위치를 누르면 그 위치에 그려진 개미가 선택됨 ({matched}/{tried})");
+        ClearAntSelection();
     }
 
     // ---------------- 입력 포커스·단축키·저장 UX ----------------

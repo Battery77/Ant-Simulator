@@ -296,3 +296,97 @@ public class AuditSA03SupportedRangeTests
         Assert.Null(host.Failure);
     }
 }
+
+/// <summary>SA05: 클릭 선택은 화면에 그린 위치(같은 프레임·같은 보간 계수)로 판단한다.</summary>
+public class AuditSA05SelectionTests
+{
+    private static AntFrame Frame(params (int Id, LayerId Layer, float PrevX, float PrevY, float X, float Y)[] ants)
+    {
+        var frame = new AntFrame();
+        frame.SetForTest(ants.Select(a => a.Id).ToArray(), ants.Select(a => (byte)a.Layer).ToArray(),
+            ants.Select(a => a.PrevX).ToArray(), ants.Select(a => a.PrevY).ToArray(), ants.Select(a => a.X).ToArray(), ants.Select(a => a.Y).ToArray());
+        return frame;
+    }
+
+    /// <summary>감사 반례: A 10.0→10.3, B 10.4→10.1, alpha 0.25. 화면상 A의 중심(10.075)을 누르면 A(현재 좌표로만 재면 B가 더 가까움).</summary>
+    [Fact]
+    public void Interpolating_ClickOnShownA_SelectsA()
+    {
+        var frame = Frame((1, LayerId.Surface, 10.0f, 5f, 10.3f, 5f), (2, LayerId.Surface, 10.4f, 5f, 10.1f, 5f));
+        const float alpha = 0.25f;
+        var (shownAx, shownAy) = frame.DisplayPosition(0, alpha);
+        Assert.Equal(10.0f + (10.3f - 10.0f) * alpha, shownAx); // 독립 기대값: 보간식 그대로
+        Assert.Equal(10.075, shownAx, 5);
+        Assert.Equal(0, frame.FindNearestShown(LayerId.Surface, alpha, shownAx, shownAy, 1f));
+        // 현재 좌표 기준이었다면 B가 골라진다(이전 동작의 반례 확인).
+        Assert.True(MathF.Abs(10.1f - shownAx) < MathF.Abs(10.3f - shownAx));
+        // B의 표시 위치(10.325)를 누르면 B
+        var (shownBx, shownBy) = frame.DisplayPosition(1, alpha);
+        Assert.Equal(1, frame.FindNearestShown(LayerId.Surface, alpha, shownBx, shownBy, 1f));
+    }
+
+    /// <summary>일시정지(alpha = 1): 현재 좌표 기준 선택이 그대로 유지된다.</summary>
+    [Fact]
+    public void Paused_AlphaOne_UsesCurrentPositions()
+    {
+        var frame = Frame((1, LayerId.Surface, 10.0f, 5f, 10.3f, 5f), (2, LayerId.Surface, 10.4f, 5f, 10.1f, 5f));
+        Assert.Equal((10.3f, 5f), frame.DisplayPosition(0, 1f));
+        Assert.Equal(1, frame.FindNearestShown(LayerId.Surface, 1f, 10.12f, 5f, 1f));
+        Assert.Equal(0, frame.FindNearestShown(LayerId.Surface, 1f, 10.29f, 5f, 1f));
+        Assert.Equal(-1, frame.FindNearestShown(LayerId.Surface, 1f, 20f, 5f, 1f)); // 1타일 밖이면 없음
+    }
+
+    /// <summary>보는 레이어가 아닌 개미는 더 가까워도 선택되지 않는다.</summary>
+    [Fact]
+    public void OtherLayerAnts_AreNeverSelected()
+    {
+        var frame = Frame((1, LayerId.Nest, 10f, 5f, 10f, 5f), (2, LayerId.Surface, 10.6f, 5f, 10.6f, 5f));
+        Assert.Equal(1, frame.FindNearestShown(LayerId.Surface, 0.5f, 10f, 5f, 1f));
+        Assert.Equal(0, frame.FindNearestShown(LayerId.Nest, 0.5f, 10f, 5f, 1f));
+        Assert.Equal(-1, frame.FindNearestShown(LayerId.Nest, 0.5f, 10.6f + 1.2f, 5f, 1f));
+    }
+
+    /// <summary>보간 중 프레임이 바뀌어도 선택은 (그 프레임, 그 보간 계수)로 그린 위치와 일치한다.</summary>
+    [Fact]
+    public void FrameUpdate_SelectionFollowsTheDrawnFrame()
+    {
+        var first = Frame((1, LayerId.Surface, 0f, 0f, 1f, 0f), (2, LayerId.Surface, 2f, 0f, 1.2f, 0f));
+        var second = Frame((1, LayerId.Surface, 1f, 0f, 2f, 0f), (2, LayerId.Surface, 1.2f, 0f, 0.4f, 0f));
+        foreach (var (frame, alpha) in new[] { (first, 0.3f), (first, 0.9f), (second, 0.1f), (second, 0.6f) })
+        for (int i = 0; i < frame.Count; i++)
+        {
+            var (x, y) = frame.DisplayPosition(i, alpha);
+            Assert.Equal(i, frame.FindNearestShown(LayerId.Surface, alpha, x, y, 1f));
+        }
+    }
+
+    /// <summary>
+    /// 실제 계산 스레드가 게시한 프레임(초기화 전후): 초기화 뒤 같은 ID가 다른 개미가 되어도, 프레임과 세대가 함께 있으므로
+    /// 선택은 화면에 그린 그 프레임의 개미다(세대가 바뀌면 화면이 선택을 해제하는 규칙은 Godot 스모크에서 확인).
+    /// </summary>
+    [Fact]
+    public async Task PublishedFrames_AcrossReset_SelectByDrawnPositionAndGeneration()
+    {
+        using var host = new SimulationHost(new SimulationSession(SimulationSessionTests.SampleWorld(), ScentSettings.Default,
+            AntSettings.Default with { InitialCount = 30, Seed = 4 }));
+        await host.RunExclusiveAsync(s => { s.Step(40); return true; }).WaitAsync(TimeSpan.FromSeconds(10));
+        var before = await StageAResetIntegrationTests.TakeSnapshot(host, s => s.Tick == 40, "틱 40");
+        var result = await host.ResetAsync().WaitAsync(TimeSpan.FromSeconds(10));
+        var after = await StageAResetIntegrationTests.TakeSnapshot(host, s => s.ResetCount == result.ResetCount, "초기화 후");
+        Assert.True(before.ResetCount < after.ResetCount);
+        foreach (var snapshot in new[] { before, after })
+        {
+            var frame = snapshot.Ants;
+            for (int i = 0; i < frame.Count; i++)
+            {
+                var layer = (LayerId)frame.Layer[i];
+                var (x, y) = frame.DisplayPosition(i, 0.5f);
+                int picked = frame.FindNearestShown(layer, 0.5f, x, y, 1f);
+                var (px, py) = frame.DisplayPosition(picked, 0.5f);
+                Assert.Equal((x, y), (px, py)); // 같은 위치에 여러 마리가 겹치면 앞 인덱스가 골라지지만 그린 위치는 같다
+            }
+        }
+        host.Release(before);
+        host.Release(after);
+    }
+}

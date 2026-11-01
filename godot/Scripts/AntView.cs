@@ -55,8 +55,7 @@ public partial class AntView : Node2D
         for (int i = 0; i < frame.Count; i++)
         {
             if (frame.Layer[i] != (byte)layer) continue;
-            float x = frame.PrevX[i] + (frame.X[i] - frame.PrevX[i]) * alpha;
-            float y = frame.PrevY[i] + (frame.Y[i] - frame.PrevY[i]) * alpha;
+            var (x, y) = frame.DisplayPosition(i, alpha); // 클릭 선택과 같은 보간식
             float size = frame.Size[i];
             var (sin, cos) = MathF.SinCos(frame.Heading[i]);
             int o = n * FloatsPerInstance;
