@@ -390,3 +390,108 @@ public class AuditSA05SelectionTests
         host.Release(after);
     }
 }
+
+/// <summary>SA03-R1: 공개 AntSpawner.TrySpawn이 잘못된 설정·방향으로 개미를 만들지 않는다(실패 시 상태 불변).</summary>
+public class AuditSA03R1SpawnTests
+{
+    private static readonly AntSettings Valid = AntSettings.Default with { InitialCount = 3, Seed = 9 };
+
+    private static SimulationSession NewSession() => new(AuditStageA.Nest(), ScentSettings.Default, Valid);
+
+    private static (int Count, int NextId, ulong Hash) State(SimulationSession s) => (s.Ants.Count, s.Ants.NextId, s.ComputeStateHash());
+
+    public static IEnumerable<object[]> InvalidSettings() => new[]
+    {
+        new object[] { "TurnIntervalMax = +Inf", Valid with { TurnIntervalMax = float.PositiveInfinity } },
+        new object[] { "TurnIntervalMax = NaN", Valid with { TurnIntervalMax = float.NaN } },
+        new object[] { "BaseSpeed = 0", Valid with { BaseSpeed = 0 } },
+        new object[] { "속도 구간 없음", Valid with { QuantitySpeedTiers = Array.Empty<SpeedTier>() } },
+    };
+
+    /// <summary>감사 반례 A(+ NaN): 검증을 통과하지 못하는 설정을 직접 넘기면 생성하지 않고 Count·NextId·상태 해시가 그대로다.</summary>
+    [Theory]
+    [MemberData(nameof(InvalidSettings))]
+    public void InvalidSettings_AreRejected_StateUnchanged(string name, AntSettings settings)
+    {
+        Assert.NotEmpty(settings.Validate());
+        var session = NewSession();
+        var before = State(session);
+        Assert.False(AntSpawner.TrySpawn(session.Ants, session.World, settings, LayerId.Nest, 20.5f, 20.5f, out int index), name);
+        Assert.Equal(-1, index);
+        Assert.Equal(before, State(session));
+        ExperimentSerializer.ValidateForSave(session);
+    }
+
+    /// <summary>감사 반례 B(+ 무한대): 비유한 방향은 거부하고 상태가 그대로다. 이후 Step도 정상.</summary>
+    [Theory]
+    [InlineData(float.NaN)]
+    [InlineData(float.PositiveInfinity)]
+    [InlineData(float.NegativeInfinity)]
+    public void NonFiniteHeading_IsRejected_StateUnchanged(float heading)
+    {
+        var session = NewSession();
+        var before = State(session);
+        Assert.False(AntSpawner.TrySpawn(session.Ants, session.World, Valid, LayerId.Nest, 20.5f, 20.5f, out _, heading: heading));
+        Assert.Equal(before, State(session));
+        session.Step();
+        Assert.Equal(1, session.Tick);
+    }
+
+    /// <summary>유한한 큰 방향은 이동 계산과 같은 규칙((−π, π])으로 정규화해 저장·불러오기 조건을 만족한다.</summary>
+    [Theory]
+    [InlineData(10f)]
+    [InlineData(-25f)]
+    [InlineData(1e6f)]
+    public void LargeFiniteHeading_IsNormalized(float heading)
+    {
+        var session = NewSession();
+        Assert.True(AntSpawner.TrySpawn(session.Ants, session.World, Valid, LayerId.Nest, 20.5f, 20.5f, out int index, heading: heading));
+        float stored = session.Ants.Heading[index];
+        Assert.Equal(AntSystem.WrapAngle(heading), stored);
+        Assert.True(stored > -MathF.PI && stored <= MathF.PI);
+        session.Step(3);
+        var loaded = ExperimentSerializer.Load(new MemoryStream(AuditStageA.Save(session)));
+        Assert.Equal(session.ComputeStateHash(), loaded.ComputeStateHash());
+    }
+
+    /// <summary>정상 대조 + 실패 원자성: 거부 뒤 정상 생성의 ID·필드는 거부가 없었던 경우와 같고, Step·저장·불러오기가 된다.</summary>
+    [Fact]
+    public void RejectionThenValidSpawn_MatchesSpawnWithoutRejection()
+    {
+        var reference = NewSession();
+        Assert.True(AntSpawner.TrySpawn(reference.Ants, reference.World, Valid, LayerId.Nest, 20.5f, 20.5f, out int refIndex));
+
+        var session = NewSession();
+        Assert.False(AntSpawner.TrySpawn(session.Ants, session.World, Valid with { TurnIntervalMax = float.PositiveInfinity }, LayerId.Nest, 20.5f, 20.5f, out _));
+        Assert.False(AntSpawner.TrySpawn(session.Ants, session.World, Valid, LayerId.Nest, 20.5f, 20.5f, out _, heading: float.NaN));
+        Assert.True(AntSpawner.TrySpawn(session.Ants, session.World, Valid, LayerId.Nest, 20.5f, 20.5f, out int index));
+
+        Assert.Equal(refIndex, index);
+        Assert.Equal(reference.Ants.Get(refIndex), session.Ants.Get(index)); // ID 3, 방향·속도·크기 등 같은 난수 소비
+        Assert.Equal(reference.Ants.NextId, session.Ants.NextId);
+        Assert.Equal(reference.ComputeStateHash(), session.ComputeStateHash());
+
+        session.Step(10);
+        reference.Step(10);
+        Assert.Equal(reference.ComputeStateHash(), session.ComputeStateHash());
+        var loaded = ExperimentSerializer.Load(new MemoryStream(AuditStageA.Save(session)));
+        Assert.Equal(session.ComputeStateHash(), loaded.ComputeStateHash());
+        Assert.Equal(session.Ants.Ids.ToArray(), loaded.Ants.Ids.ToArray());
+    }
+
+    /// <summary>정상 입력의 생성 결과는 수정 전과 같다(초기 생성 난수 순서·결정성 유지): 고정 시드 생성의 상태 해시.</summary>
+    [Fact]
+    public void InitialSpawn_IsDeterministic_AndExplicitHeadingInRangeIsKept()
+    {
+        var a = new SimulationSession(AuditStageA.Nest(), ScentSettings.Default, AntSettings.Default with { InitialCount = 500, Seed = 21 });
+        var b = new SimulationSession(AuditStageA.Nest(), ScentSettings.Default, AntSettings.Default with { InitialCount = 500, Seed = 21 });
+        Assert.Equal(a.ComputeStateHash(), b.ComputeStateHash());
+        Assert.Equal(new AntSpawnReport(500, 500), a.LastSpawn);
+
+        foreach (float heading in new[] { 0f, 1f, -1f, MathF.PI, -MathF.PI / 2, 3.1f })
+        {
+            Assert.True(AntSpawner.TrySpawn(a.Ants, a.World, Valid, LayerId.Nest, 20.5f, 20.5f, out int i, heading: heading));
+            Assert.Equal(heading, a.Ants.Heading[i]); // (−π, π] 안의 값은 그대로
+        }
+    }
+}
