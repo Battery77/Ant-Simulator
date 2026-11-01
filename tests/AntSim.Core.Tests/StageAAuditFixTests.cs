@@ -99,6 +99,74 @@ public class AuditSA01SpeedTierLimitTests
     }
 }
 
+/// <summary>SA02: 속도 배율 갱신이 float 반올림으로 0(또는 구간 밖)이 되지 않는다.</summary>
+public class AuditSA02SpeedFactorTests
+{
+    /// <summary>
+    /// 감사 반례(평활화 0) + 자체 검증에서 찾은 같은 원인의 경우(평활화 0.001초: 1 − exp(−dt/T)가 float로 정확히 1이 됨).
+    /// 1 → 1e-8로 바뀔 때 결과는 정확히 1e-8이어야 하고, 저장·불러오기가 되어야 한다.
+    /// </summary>
+    [Theory]
+    [InlineData(0f)]
+    [InlineData(0.001f)]
+    public void ImmediateSlowdown_ToTinyFactor_IsExact_AndSaveable(float smoothingSeconds)
+    {
+        var settings = AntSettings.Default with
+        {
+            InitialCount = 0, SpeedFactorSmoothingSeconds = smoothingSeconds,
+            QuantitySpeedTiers = new[] { new SpeedTier(0, 1f), new SpeedTier(1, 1e-8f) },
+        };
+        Assert.Empty(settings.Validate());
+        var session = new SimulationSession(AuditStageA.Open(16), ScentSettings.Default, settings);
+        Assert.True(AntSpawner.TrySpawn(session.Ants, session.World, settings, LayerId.Surface, 5.5f, 5.5f, out _, heading: 0));
+        Assert.Equal(1f, session.Ants.SpeedFactor[0]);
+        new MapEditor(session.World).Apply(EditOp.SetQuantity(LayerId.Surface, 5, 5, QuantityKind.Food, 1));
+
+        session.Step();
+        Assert.Equal(1e-8f, session.Ants.SpeedFactor[0]);
+        var loaded = ExperimentSerializer.Load(new MemoryStream(AuditStageA.Save(session)));
+        Assert.Equal(session.ComputeStateHash(), loaded.ComputeStateHash());
+
+        // 다시 수량 0 타일로 돌아가면 1로 복귀(즉시 경로는 목표값 그대로).
+        new MapEditor(session.World).Apply(EditOp.SetQuantity(LayerId.Surface, 5, 5, QuantityKind.Food, 0));
+        session.Step();
+        if (smoothingSeconds == 0) Assert.Equal(1f, session.Ants.SpeedFactor[0]);
+        Assert.True(session.Ants.SpeedFactor[0] > 0 && session.Ants.SpeedFactor[0] <= 1);
+    }
+
+    /// <summary>일반 평활화: 여러 평활화 시간·틱·구간 배율에서 배율은 항상 직전 값과 목표 사이(양수, 1 이하)이고 저장 가능하다.</summary>
+    [Fact]
+    public void Smoothing_StaysBetweenPreviousAndTarget()
+    {
+        var rng = new Random(11);
+        foreach (float smoothing in new[] { 0f, 1e-30f, 1e-6f, 0.001f, 0.05f, 0.15f, 1f, 100f })
+        foreach (double dt in new[] { 0.001, 0.1, 1, 10 })
+        {
+            float low = new[] { 1e-8f, 1e-3f, 0.5f, 0.85f }[rng.Next(4)];
+            var settings = AntSettings.Default with
+            {
+                InitialCount = 0, SpeedFactorSmoothingSeconds = smoothing,
+                QuantitySpeedTiers = new[] { new SpeedTier(0, 1f), new SpeedTier(1, low) },
+            };
+            var scent = ScentSettings.Default with { TickSeconds = dt, Types = ScentSettings.Default.Types.Select(t => t with { Diffusion = 0.01, PassageDiffusion = 0.01 }).ToArray() };
+            var session = new SimulationSession(AuditStageA.Open(16), scent, settings);
+            AntSpawner.TrySpawn(session.Ants, session.World, settings, LayerId.Surface, 5.5f, 5.5f, out _, heading: 0, baseSpeed: 1e-6f);
+            for (int tick = 0; tick < 6; tick++)
+            {
+                int quantity = tick % 3 == 2 ? 0 : 1;
+                new MapEditor(session.World).Apply(EditOp.SetQuantity(LayerId.Surface, 5, 5, QuantityKind.Food, quantity));
+                float before = session.Ants.SpeedFactor[0], target = settings.SpeedFactorFor(quantity);
+                session.Step();
+                float after = session.Ants.SpeedFactor[0];
+                Assert.True(after >= MathF.Min(before, target) && after <= MathF.Max(before, target),
+                    $"T={smoothing} dt={dt} {before:R} → {after:R} (목표 {target:R})");
+                Assert.True(after > 0);
+            }
+            ExperimentSerializer.ValidateForSave(session);
+        }
+    }
+}
+
 /// <summary>SA03: 검증을 통과한 설정은 생성·틱 계산에서 비정상 값·예외·부분 틱을 만들지 않는다.</summary>
 public class AuditSA03SupportedRangeTests
 {

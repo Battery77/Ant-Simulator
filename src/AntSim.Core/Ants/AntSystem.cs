@@ -7,7 +7,8 @@ namespace AntSim.Core.Ants;
 /// 1) 방향 결정(무작위 탐색: 개체별 간격으로 ±각도 안에서 새 목표 방향, 목표 방향으로 부드럽게 회전)
 /// 2) 속도 결정(기본 속도 × 현재 타일 먹이·유충 수량에 따른 배율, 타일이 바뀌면 부드럽게 변함)
 /// 3) 경로 검사 이동(막히면 경계 앞에서 멈추고 열린 방향을 새로 고름)
-/// 4) 통로 중심 타일에 새로 들어서면 확률적으로 레이어 전환
+/// 4) 틱이 끝난 위치의 타일이 직전 틱과 다르고 그 타일이 통로 중심이면 확률적으로 레이어 전환(단계 A 임시 규칙: 한 틱 이동 중
+///    지나치기만 한 통로 중심은 보지 않는다. 목표 기반 층간 이동은 이후 단계에서 다시 설계한다)
 /// 단계 B~D는 1)의 방향 결정에 감각·기억·목표 가중치를 더하는 식으로 확장한다.
 /// 모든 난수는 개체별 상태에서 뽑으므로 같은 시드·입력이면 항상 같은 결과다. 틱당 할당 없음.
 /// </summary>
@@ -53,7 +54,7 @@ public sealed class AntSystem
             int tileX = (int)MathF.Floor(x[i]), tileY = (int)MathF.Floor(y[i]);
             var state = layer.GetState(tileX, tileY);
             float desired = settings.SpeedFactorFor(state.TotalQuantity);
-            speedFactor[i] += (desired - speedFactor[i]) * smoothing;
+            speedFactor[i] = SmoothSpeedFactor(speedFactor[i], desired, smoothing);
 
             // 3) 경로 검사 이동.
             float distance = baseSpeed[i] * speedFactor[i] * dt;
@@ -74,7 +75,7 @@ public sealed class AntSystem
                 turnTimer[i] = NextTurnInterval(settings, turnScale[i], ref rng[i]);
             }
 
-            // 4) 통로: 통로 중심 타일에 새로 들어선 경우에만 레이어 전환을 시도한다.
+            // 4) 통로: 틱이 끝난 위치가 새 타일이고 그 타일이 통로 중심일 때만 레이어 전환을 시도한다(이동 경로 중간의 통로는 보지 않음).
             tileX = (int)MathF.Floor(x[i]);
             tileY = (int)MathF.Floor(y[i]);
             int tile = tileY * width + tileX;
@@ -94,6 +95,18 @@ public sealed class AntSystem
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// 속도 배율을 목표로 다가가게 한다. 실수 계산이면 결과는 항상 이전 값과 목표 사이(둘 다 (0, 1])지만, float에서는
+    /// 1 + (1e-8 − 1) = 0처럼 반올림으로 구간을 벗어날 수 있다(감사 SA02). smoothing ≥ 1(평활화 0초, 또는 1 − exp(−dt/T)가 1로 반올림)이면
+    /// 목표를 그대로 쓰고, 그 밖에는 결과를 두 값 사이로 맞춘다. 정상 값에서는 이미 구간 안이라 결과가 바뀌지 않는다.
+    /// </summary>
+    internal static float SmoothSpeedFactor(float current, float desired, float smoothing)
+    {
+        if (smoothing >= 1) return desired;
+        float next = current + (desired - current) * smoothing;
+        return Math.Clamp(next, MathF.Min(current, desired), MathF.Max(current, desired));
     }
 
     internal static float NextTurnInterval(AntSettings settings, float scale, ref ulong rng) =>
