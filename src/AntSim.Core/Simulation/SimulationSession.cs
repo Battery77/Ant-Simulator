@@ -28,6 +28,7 @@ public sealed class SimulationSession
         ThrowIfInvalid(settings);
         AntSettings = ants ?? AntSettings.None;
         ThrowIfInvalid(AntSettings);
+        ThrowIfTickUnsupported(settings.TickSeconds, AntSettings.InitialCount > 0);
         _initialWorld = source.Clone();
         _world = _initialWorld.Clone();
         _scentSystem = new ScentSystem(_world);
@@ -42,6 +43,7 @@ public sealed class SimulationSession
     {
         ThrowIfInvalid(settings);
         ThrowIfInvalid(antSettings);
+        ThrowIfTickUnsupported(settings.TickSeconds, ants.Count > 0 || antSettings.InitialCount > 0);
         AntSettings = antSettings;
         Ants = ants;
         LastSpawn = new AntSpawnReport(antSettings.InitialCount, ants.Count);
@@ -83,8 +85,13 @@ public sealed class SimulationSession
     {
         for (int i = 0; i < ticks; i++)
         {
+            // 개미 계산이 거부할 틱 간격이면 냄새를 바꾸기 전에 멈춘다(냄새만 갱신된 부분 틱 방지). 설정·생성·불러오기 검증으로
+            // 이 상태에 오지 않아야 하며, 이는 마지막 방어선이다.
+            float antDt = (float)Settings.TickSeconds;
+            if (Ants.Count > 0 && !AntSettings.SupportsTick(Settings.TickSeconds))
+                throw new InvalidOperationException(AntSettings.TickNotSupportedMessage(Settings.TickSeconds));
             _scentSystem.Tick(Scent, Settings);
-            if (Ants.Count > 0) _antSystem.Tick(Ants, _world, AntSettings, (float)Settings.TickSeconds);
+            if (Ants.Count > 0) _antSystem.Tick(Ants, _world, AntSettings, antDt);
             Tick++;
             ElapsedSeconds += Settings.TickSeconds;
         }
@@ -96,11 +103,9 @@ public sealed class SimulationSession
     /// </summary>
     public void Reset(AntSettings? ants = null)
     {
-        if (ants is not null)
-        {
-            ThrowIfInvalid(ants);
-            AntSettings = ants;
-        }
+        if (ants is not null) ThrowIfInvalid(ants);
+        ThrowIfTickUnsupported(Settings.TickSeconds, (ants ?? AntSettings).InitialCount > 0);
+        if (ants is not null) AntSettings = ants;
         _world = _initialWorld.Clone();
         _scentSystem = new ScentSystem(_world);
         Ants.Clear();
@@ -122,6 +127,8 @@ public sealed class SimulationSession
         if (errors.Count > 0) return errors;
         if (!settings.HasSameTypesAs(Settings))
             return new[] { "냄새 종류 구성은 실행 중에 바꿀 수 없습니다. 새 시뮬레이션을 시작하세요." };
+        if ((Ants.Count > 0 || AntSettings.InitialCount > 0) && !AntSettings.SupportsTick(settings.TickSeconds))
+            return new[] { AntSettings.TickNotSupportedMessage(settings.TickSeconds) };
         Settings = settings;
         return Array.Empty<string>();
     }
@@ -135,6 +142,13 @@ public sealed class SimulationSession
         hash.Add(Scent.ComputeHash());
         hash.Add(Ants.ComputeHash());
         return hash.Value;
+    }
+
+    /// <summary>개미가 있거나 생길 실험이면 틱 간격이 개미 계산 범위 안이어야 한다(감사 SA03). 개미 없는 냄새 실험은 제한하지 않는다.</summary>
+    private static void ThrowIfTickUnsupported(double tickSeconds, bool hasAnts)
+    {
+        if (hasAnts && !AntSettings.SupportsTick(tickSeconds))
+            throw new ArgumentException(AntSettings.TickNotSupportedMessage(tickSeconds), nameof(tickSeconds));
     }
 
     private static void ThrowIfInvalid(AntSettings settings)

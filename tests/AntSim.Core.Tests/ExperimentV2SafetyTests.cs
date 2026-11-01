@@ -218,6 +218,11 @@ public class ExperimentV2SafetyTests(ITestOutputHelper output)
         new object[] { "마지막 타일 음수", (Action<byte[], AntLayout>)((b, l) => Int(b, l.LastTile, -1)) },
         new object[] { "마지막 타일 맵 밖", (Action<byte[], AntLayout>)((b, l) => Int(b, l.LastTile, 80 * 60)) },
         new object[] { "난수 상태 0", (Action<byte[], AntLayout>)((b, l) => BinaryPrimitives.WriteUInt64LittleEndian(b.AsSpan(l.Rng), 0)) },
+        // 감사 SA03: 계산 중 넘침이 나는 개체 값(지원 상한 밖)
+        new object[] { "기본 속도 과대", (Action<byte[], AntLayout>)((b, l) => Float(b, l.Float(6), 1e38f)) },
+        new object[] { "크기 과대", (Action<byte[], AntLayout>)((b, l) => Float(b, l.Float(8), 1e38f)) },
+        new object[] { "타이머 과대", (Action<byte[], AntLayout>)((b, l) => Float(b, l.Float(9), 1e30f)) },
+        new object[] { "간격 배율 2", (Action<byte[], AntLayout>)((b, l) => Float(b, l.Float(10), 2f)) },
     };
 
     private static void Int(byte[] b, int at, int v) => BinaryPrimitives.WriteInt32LittleEndian(b.AsSpan(at), v);

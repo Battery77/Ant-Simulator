@@ -11,6 +11,26 @@ public sealed record AntSettings
 {
     public const int MaxCount = 100_000;
 
+    /// <summary>속도 구간 수 상한. 검증·저장·불러오기가 같은 값을 쓴다(저장할 수 있으면 불러올 수 있다).</summary>
+    public const int MaxSpeedTiers = 256;
+
+    // 지원 범위(감사 SA03). 개체 편차(±1 미만)를 곱해도 2배 미만이고, 최대 틱 간격(10초)을 곱해도 float가 넘치지 않는다
+    // (이동 거리 < 2,000 × 10 = 20,000타일, 방향 변경 간격 < 2e6초). 기본값(3타일/초, 0.8타일, 0.5~1초)보다 수백 배 이상 크다.
+
+    /// <summary>기본 속도 상한(타일/초).</summary>
+    public const float MaxBaseSpeed = 1000f;
+
+    /// <summary>표시 크기 상한(타일).</summary>
+    public const float MaxBaseSize = 1000f;
+
+    /// <summary>방향 변경 간격 상한(초).</summary>
+    public const float MaxTurnIntervalSeconds = 1e6f;
+
+    /// <summary>개체별 값의 상한: 설정 상한 × (1 + 편차 &lt; 1).</summary>
+    public const float MaxIndividualSpeed = 2 * MaxBaseSpeed;
+    public const float MaxIndividualSize = 2 * MaxBaseSize;
+    public const float MaxIndividualTurnTimer = 2 * MaxTurnIntervalSeconds;
+
     // 아래 None/Default보다 먼저 초기화되어야 한다(정적 초기화는 선언 순서).
     public static IReadOnlyList<SpeedTier> DefaultQuantitySpeedTiers { get; } = new[]
     {
@@ -57,7 +77,7 @@ public sealed record AntSettings
     public float SpeedFactorSmoothingSeconds { get; init; } = 0.15f;
 
     /// <summary>
-    /// 통로 중심 타일에 새로 들어섰을 때 반대 레이어로 넘어갈 확률(단계 A의 임시 규칙).
+    /// 틱이 끝난 위치가 새 타일이고 그 타일이 통로 중심일 때 반대 레이어로 넘어갈 확률(단계 A의 임시 규칙, 이동 경로 중간의 통로는 보지 않음).
     /// 단계 C에서 목표·행동이 통로 이용을 결정하게 되면 대체된다.
     /// </summary>
     public float PassageUseProbability { get; init; } = 0.5f;
@@ -75,22 +95,37 @@ public sealed record AntSettings
         return factor;
     }
 
+    /// <summary>
+    /// 개미 계산은 틱 간격을 float로 쓴다. double 틱 간격이 float로 0이 되면(약 1.4e-45초 미만) 개미가 있는 실험을 진행할 수 없다.
+    /// 냄새만 있는 실험(개미 0마리)에는 적용하지 않는다(PR #2의 냄새 틱 범위는 그대로).
+    /// </summary>
+    public static bool SupportsTick(double tickSeconds) => (float)tickSeconds > 0 && float.IsFinite((float)tickSeconds);
+
+    public static string TickNotSupportedMessage(double tickSeconds) =>
+        $"틱 간격 {tickSeconds}초는 개미 계산(float)에서 0이 되어 개미가 있는 실험에 쓸 수 없습니다.";
+
     public IReadOnlyList<string> Validate()
     {
         var errors = new List<string>();
         if (InitialCount < 0 || InitialCount > MaxCount) errors.Add($"개미 수는 0~{MaxCount}이어야 합니다 (현재 {InitialCount}).");
         Positive(errors, "기본 속도", BaseSpeed);
         Positive(errors, "기본 크기", BaseSize);
+        if (BaseSpeed > MaxBaseSpeed) errors.Add($"기본 속도는 {MaxBaseSpeed}타일/초 이하여야 합니다 (현재 {BaseSpeed}).");
+        if (BaseSize > MaxBaseSize) errors.Add($"기본 크기는 {MaxBaseSize}타일 이하여야 합니다 (현재 {BaseSize}).");
         Fraction(errors, "속도 편차", SpeedVariation);
         Fraction(errors, "크기 편차", SizeVariation);
         Fraction(errors, "방향 변경 간격 편차", TurnIntervalVariation);
         Positive(errors, "방향 변경 최소 간격", TurnIntervalMin);
         if (!(TurnIntervalMax >= TurnIntervalMin)) errors.Add("방향 변경 최대 간격은 최소 간격 이상이어야 합니다.");
+        if (!(TurnIntervalMax <= MaxTurnIntervalSeconds))
+            errors.Add($"방향 변경 최대 간격은 {MaxTurnIntervalSeconds}초 이하의 유한한 값이어야 합니다 (현재 {TurnIntervalMax}).");
         if (!(WanderAngleDegrees >= 0 && WanderAngleDegrees <= 180)) errors.Add("탐색 회전 각도는 0~180도여야 합니다.");
         Positive(errors, "회전 속도", TurnRateDegreesPerSecond);
         if (!(SpeedFactorSmoothingSeconds >= 0) || float.IsInfinity(SpeedFactorSmoothingSeconds)) errors.Add("감속 완화 시간은 0 이상이어야 합니다.");
         if (!(PassageUseProbability >= 0 && PassageUseProbability <= 1)) errors.Add("통로 이용 확률은 0~1이어야 합니다.");
 
+        if (QuantitySpeedTiers.Count > MaxSpeedTiers)
+            errors.Add($"속도 구간은 {MaxSpeedTiers}개 이하여야 합니다 (현재 {QuantitySpeedTiers.Count}).");
         if (QuantitySpeedTiers.Count == 0 || QuantitySpeedTiers[0].MinQuantity != 0)
             errors.Add("속도 구간은 수량 0부터 시작해야 합니다.");
         for (int i = 0; i < QuantitySpeedTiers.Count; i++)

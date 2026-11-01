@@ -72,6 +72,8 @@ public static class AntSpawner
         ulong rng = AntRandom.CreateState(settings.Seed, (ulong)id);
         float speed = baseSpeed ?? settings.BaseSpeed * (1 + settings.SpeedVariation * AntRandom.Range(ref rng, -1f, 1f));
         float bodySize = size ?? settings.BaseSize * (1 + settings.SizeVariation * AntRandom.Range(ref rng, -1f, 1f));
+        // 개별 지정 값도 설정과 같은 지원 범위 안이어야 한다(계산 중 넘침 방지, 감사 SA03).
+        if (!(speed > 0 && speed <= AntSettings.MaxIndividualSpeed) || !(bodySize > 0 && bodySize <= AntSettings.MaxIndividualSize)) return false;
         float direction = heading ?? AntRandom.Range(ref rng, -MathF.PI, MathF.PI);
         float intervalScale = 1 + settings.TurnIntervalVariation * AntRandom.Range(ref rng, -1f, 1f);
         // 첫 방향 결정 시점을 개체마다 흩어 놓아 갱신 부하와 움직임이 한 틱에 몰리지 않게 한다.
