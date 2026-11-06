@@ -43,7 +43,7 @@ public partial class EditorPanel : PanelContainer
         root.AddThemeConstantOverride("separation", 6);
         scroll.AddChild(root);
 
-        root.AddChild(Header("레이어 (Tab)"));
+        root.AddChild(Header("레이어 (Ctrl+Tab)"));
         var layers = new HBoxContainer();
         root.AddChild(layers);
         foreach (var layer in new[] { LayerId.Surface, LayerId.Nest })

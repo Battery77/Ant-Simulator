@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using AntSim.Core.Ants;
 using AntSim.Core.Editing;
 using AntSim.Core.Rendering;
 using AntSim.Core.Scent;
@@ -145,6 +146,28 @@ Measure("ExperimentSerializer.Save", () =>
     AntSim.Core.Serialization.ExperimentSerializer.Save(scentSession, expStream);
 }, config.TileCount * 2L);
 Console.WriteLine($"  실험 파일 크기: {expStream.Length / 1024.0 / 1024.0:F2} MiB");
+
+// 개미(단계 A 이동): 개미집 프리셋 + 통로 2000개, 개미 수를 늘려 가며 1틱 비용을 잰다.
+// JIT 단계별 최적화가 끝나도록 1초 동안 먼저 돌린다(그렇지 않으면 앞쪽 측정이 과대평가된다).
+{
+    var warmWorld = scentWorld.Clone();
+    var warmAnts = new AntPopulation();
+    var warmSettings = AntSettings.Default with { InitialCount = 2000 };
+    AntSpawner.SpawnInitial(warmAnts, warmWorld, warmSettings);
+    var warmSystem = new AntSystem();
+    var warmClock = Stopwatch.StartNew();
+    while (warmClock.Elapsed.TotalSeconds < 1) warmSystem.Tick(warmAnts, warmWorld, warmSettings, 0.1f);
+}
+foreach (int antCount in new[] { 100, 1000, 5000, 10000, 20000 })
+{
+    var antWorld = scentWorld.Clone();
+    var population = new AntPopulation();
+    var antSettings = AntSettings.Default with { InitialCount = antCount, Seed = 7 };
+    var report = AntSpawner.SpawnInitial(population, antWorld, antSettings);
+    var antSystem = new AntSystem();
+    for (int t = 0; t < 50; t++) antSystem.Tick(population, antWorld, antSettings, 0.1f); // 지상으로 퍼지게
+    Measure($"개미 1틱 ×{report.Spawned}", () => antSystem.Tick(population, antWorld, antSettings, 0.1f), report.Spawned);
+}
 
 Console.WriteLine();
 Console.WriteLine($"(sink {sink & 1})");
