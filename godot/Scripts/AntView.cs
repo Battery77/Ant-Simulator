@@ -21,6 +21,21 @@ public partial class AntView : Node2D
     private float _selectedHeading;
     private float _selectedSize;
 
+    // 선택한 개미의 센서 세 점(개미 위치 기준 오프셋)과 표시 정보. 감각 상세가 없으면 _sensorCount = 0.
+    private readonly Vector2[] _sensorOffsets = new Vector2[3];
+    private readonly bool[] _sensorBlocked = new bool[3];
+    private readonly float[] _sensorLevel = new float[3];
+    private int _sensorCount;
+
+    private static readonly Color SensorColor = new(0.35f, 0.95f, 1f);
+    private static readonly Color SensorBlockedColor = new(1f, 0.25f, 0.25f);
+
+    /// <summary>센서 표시 중인가(스모크 테스트용).</summary>
+    public bool ShowingSensors => _selectedPosition is not null && _sensorCount > 0;
+
+    /// <summary>그린 센서 중 차폐 표시 수(스모크 테스트용).</summary>
+    public int BlockedSensorsShown { get; private set; }
+
     /// <summary>
     /// 컬링 범위를 월드 전체로 지정한다. MultiMesh가 자동 계산한 AABB는 Z 두께가 0이고 빈 인스턴스(원점)까지 포함해
     /// 2D 컬링에서 개미 전체가 그려지지 않는 경우가 있었다(Godot 4.4.1, GL Compatibility에서 재현).
@@ -47,8 +62,9 @@ public partial class AntView : Node2D
     /// 프레임의 개미 중 <paramref name="layer"/>에 있는 개미를 그린다.
     /// <paramref name="alpha"/>: 0 = 이전 틱 위치, 1 = 현재 틱 위치.
     /// </summary>
-    public void ShowFrame(AntFrame frame, LayerId layer, float alpha, int selectedId)
+    public void ShowFrame(AntFrame frame, LayerId layer, float alpha, int selectedId, AntSenseDetail? sense = null)
     {
+        SetSensors(sense, layer);
         EnsureCapacity(frame.Count);
         int n = 0;
         _selectedPosition = null;
@@ -81,10 +97,35 @@ public partial class AntView : Node2D
         QueueRedraw();
     }
 
+    /// <summary>
+    /// 선택한 개미의 센서 표시를 정한다. 점 위치는 계산 스레드가 현재 틱의 위치·방향으로 계산한 센서 좌표이고, 화면에 그린 개미 위치에
+    /// 같은 오프셋으로 붙인다(재생 중 보간 위치와 어긋나지 않도록). 차폐 표시는 같은 위치의 현재 지형 기준, 점 밝기는 마지막 감지 값
+    /// (첫 감지 종류, 세 센서 중 최대값 대비)이다.
+    /// </summary>
+    private void SetSensors(AntSenseDetail? sense, LayerId layer)
+    {
+        _sensorCount = 0;
+        BlockedSensorsShown = 0;
+        if (sense is null || sense.Layer != layer) return;
+        float max = 0;
+        for (int d = 0; d < 3; d++)
+        {
+            _sensorOffsets[d] = new Vector2(sense.SensorPoints[2 * d] - sense.X, sense.SensorPoints[2 * d + 1] - sense.Y);
+            _sensorBlocked[d] = (sense.SensorPointsBlocked & (1 << d)) != 0;
+            _sensorLevel[d] = sense.HasSensed && sense.Keys.Count > 0 ? sense.Value(0, d) : 0;
+            max = MathF.Max(max, _sensorLevel[d]);
+            if (_sensorBlocked[d]) BlockedSensorsShown++;
+        }
+        for (int d = 0; d < 3; d++) _sensorLevel[d] = max > 0 ? _sensorLevel[d] / max : 0;
+        _sensorCount = 3;
+    }
+
     public void Clear()
     {
         VisibleCount = 0;
         _selectedPosition = null;
+        _sensorCount = 0;
+        BlockedSensorsShown = 0;
         if (_multiMesh is not null) _multiMesh.VisibleInstanceCount = 0;
         QueueRedraw();
     }
@@ -96,6 +137,22 @@ public partial class AntView : Node2D
         DrawArc(p, MathF.Max(0.8f, _selectedSize), 0, MathF.Tau, 24, SelectionColor, 0.12f);
         var (sin, cos) = MathF.SinCos(_selectedHeading);
         DrawLine(p, p + new Vector2(cos, sin) * 2.5f, SelectionColor, 0.12f);
+
+        // 센서 세 점(왼쪽·정면·오른쪽): 열린 센서는 원(채움 밝기 = 마지막 감지 값 상대 크기), 차폐된 센서는 빨간 X.
+        for (int d = 0; d < _sensorCount; d++)
+        {
+            var q = p + _sensorOffsets[d];
+            if (_sensorBlocked[d])
+            {
+                const float r = 0.22f;
+                DrawLine(q + new Vector2(-r, -r), q + new Vector2(r, r), SensorBlockedColor, 0.09f);
+                DrawLine(q + new Vector2(-r, r), q + new Vector2(r, -r), SensorBlockedColor, 0.09f);
+                continue;
+            }
+            DrawLine(p, q, new Color(SensorColor, 0.45f), 0.05f);
+            DrawCircle(q, 0.2f, new Color(SensorColor, 0.15f + 0.8f * _sensorLevel[d]));
+            DrawArc(q, 0.2f, 0, MathF.Tau, 16, SensorColor, 0.06f);
+        }
     }
 
     private void EnsureCapacity(int count)

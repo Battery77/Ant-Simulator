@@ -8,7 +8,7 @@ namespace AntSim.Core.Simulation;
 /// <summary>
 /// 시뮬레이션 모드의 독립 실험 상태. 시작할 때 편집 월드를 복제하므로, 시뮬레이션은 원본 맵을 바꾸지 않고
 /// 원본 편집도 시뮬레이션에 영향을 주지 않는다. 같은 시작 월드·설정·틱 수면 항상 같은 상태가 된다.
-/// 한 틱의 순서는 냄새(확산 → 감쇠 → 발생) → 개미다.
+/// 한 틱의 순서는 냄새(확산 → 감쇠 → 발생) → 개미 감각(단계 B1, 이동 전) → 개미 이동이다.
 /// </summary>
 /// <remarks>스레드 안전하지 않다. <see cref="SimulationHost"/>가 계산 스레드에서만 다룬다.</remarks>
 public sealed class SimulationSession
@@ -29,6 +29,8 @@ public sealed class SimulationSession
         AntSettings = ants ?? AntSettings.None;
         ThrowIfInvalid(AntSettings);
         ThrowIfTickUnsupported(settings.TickSeconds, AntSettings.InitialCount > 0);
+        Sensing = AntSensingConfig.Create(AntSettings, settings);
+        Ants.ConfigureSensing(Sensing.TypeCount);
         _initialWorld = source.Clone();
         _world = _initialWorld.Clone();
         _scentSystem = new ScentSystem(_world);
@@ -44,6 +46,9 @@ public sealed class SimulationSession
         ThrowIfInvalid(settings);
         ThrowIfInvalid(antSettings);
         ThrowIfTickUnsupported(settings.TickSeconds, ants.Count > 0 || antSettings.InitialCount > 0);
+        Sensing = AntSensingConfig.Create(antSettings, settings);
+        if (ants.SensedTypeCount != Sensing.TypeCount)
+            throw new ArgumentException("개미 감지 종류 수가 감지 설정과 다릅니다.", nameof(ants));
         AntSettings = antSettings;
         Ants = ants;
         LastSpawn = new AntSpawnReport(antSettings.InitialCount, ants.Count);
@@ -68,6 +73,9 @@ public sealed class SimulationSession
     /// <summary>개미 생성·이동 설정. 바꾸려면 <see cref="Reset(AntSettings?)"/>에 넘긴다.</summary>
     public AntSettings AntSettings { get; private set; }
 
+    /// <summary>해석된 감지 설정(키·종류 인덱스·주기·거리·각도). 생성·초기화 때만 바뀐다.</summary>
+    public AntSensingConfig Sensing { get; private set; }
+
     /// <summary>시뮬레이션 중인 개미들(SoA).</summary>
     public AntPopulation Ants { get; } = new();
 
@@ -91,7 +99,12 @@ public sealed class SimulationSession
             if (Ants.Count > 0 && !AntSettings.SupportsTick(Settings.TickSeconds))
                 throw new InvalidOperationException(AntSettings.TickNotSupportedMessage(Settings.TickSeconds));
             _scentSystem.Tick(Scent, Settings);
-            if (Ants.Count > 0) _antSystem.Tick(Ants, _world, AntSettings, antDt);
+            if (Ants.Count > 0)
+            {
+                // 단계 B1 감각: 이번 틱 농도(Current)를 이동 전 위치·방향에서 읽는다. 이동 상태와 이동 난수는 바꾸지 않는다.
+                AntSensing.Sense(Ants, Scent, _scentSystem.OpenMasks(), Sensing, antDt, Tick + 1);
+                _antSystem.Tick(Ants, _world, AntSettings, antDt);
+            }
             Tick++;
             ElapsedSeconds += Settings.TickSeconds;
         }
@@ -105,10 +118,13 @@ public sealed class SimulationSession
     {
         if (ants is not null) ThrowIfInvalid(ants);
         ThrowIfTickUnsupported(Settings.TickSeconds, (ants ?? AntSettings).InitialCount > 0);
+        var sensing = AntSensingConfig.Create(ants ?? AntSettings, Settings); // 감지 키를 해석할 수 없으면 아무것도 바꾸지 않는다
         if (ants is not null) AntSettings = ants;
+        Sensing = sensing;
         _world = _initialWorld.Clone();
         _scentSystem = new ScentSystem(_world);
         Ants.Clear();
+        Ants.ConfigureSensing(Sensing.TypeCount);
         LastSpawn = AntSpawner.SpawnInitial(Ants, _world, AntSettings);
         Scent.Clear();
         Tick = 0;
@@ -133,6 +149,9 @@ public sealed class SimulationSession
         return Array.Empty<string>();
     }
 
+    /// <summary>감각 패스가 쓰는 레이어별 냄새 열린 칸(선택한 개미 표시용, 계산 스레드 전용).</summary>
+    internal byte[][] SenseOpenMasks() => _scentSystem.OpenMasks(refresh: true);
+
     /// <summary>월드·냄새·틱을 결합한 상태 해시(재현성 검증용).</summary>
     public ulong ComputeStateHash()
     {
@@ -141,6 +160,7 @@ public sealed class SimulationSession
         hash.Add(_world.ComputeContentHash());
         hash.Add(Scent.ComputeHash());
         hash.Add(Ants.ComputeHash());
+        hash.Add(Ants.ComputeStageBHash());
         return hash.Value;
     }
 

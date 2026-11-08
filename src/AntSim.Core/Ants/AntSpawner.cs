@@ -72,6 +72,11 @@ public static class AntSpawner
         return TrySpawnValidated(ants, world, settings, layer, x, y, out index, baseSpeed, size, heading is { } given ? AntSystem.WrapAngle(given) : null);
     }
 
+    /// <summary>
+    /// 경로 적분 오차 전용 난수 스트림 번호(단계 B2). 이동 스트림(id), 생성 위치 스트림(<see cref="ulong.MaxValue"/>)과 겹치지 않는다(id &lt; 2^31).
+    /// </summary>
+    public static ulong NavStream(int id) => (1UL << 62) + (ulong)id;
+
     /// <summary>검증된 설정으로 한 마리를 만든다(<see cref="SpawnInitial"/>·<see cref="TrySpawn"/> 공용). 방향은 비어 있거나 유한해야 한다.</summary>
     internal static bool TrySpawnValidated(AntPopulation ants, World world, AntSettings settings, LayerId layer, float x, float y,
         out int index, float? baseSpeed = null, float? size = null, float? heading = null)
@@ -95,7 +100,8 @@ public static class AntSpawner
         float factor = settings.SpeedFactorFor(worldLayer.GetState(tx, ty).TotalQuantity);
 
         index = ants.Add(id, AntCaste.Worker, AntMobility.Walk, layer, x, y, direction,
-            speed, factor, bodySize, firstTurn, intervalScale, ty * world.Config.Width + tx, rng);
+            speed, factor, bodySize, firstTurn, intervalScale, ty * world.Config.Width + tx, rng,
+            AntSensing.InitialPhase(id, settings.SensePeriodSeconds), AntRandom.CreateState(settings.Seed, NavStream(id)));
         return true;
     }
 }

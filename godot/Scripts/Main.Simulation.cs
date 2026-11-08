@@ -224,7 +224,7 @@ public partial class Main
         }
         if (_selectedAntId >= 0 && _selectedAntResetCount != s.ResetCount) ClearAntSelection();
         _antAlpha = alpha;
-        _antView.ShowFrame(s.Ants, _view.Layer, alpha, _selectedAntId);
+        _antView.ShowFrame(s.Ants, _view.Layer, alpha, _selectedAntId, SelectedSenseDetail());
         int surface = s.Ants.CountOn(LayerId.Surface);
         _simPanel.SetAntCount($"개미 {s.Ants.Count}마리 (지상 {surface} / 개미집 {s.Ants.Count - surface}) · {EditorText.Name(_view.Layer)}에 표시 {_antView.VisibleCount}");
     }
@@ -244,16 +244,57 @@ public partial class Main
         return best >= 0;
     }
 
+    /// <summary>개미를 선택하고, 계산 스레드에 그 개미의 감각 상세 게시를 요청한다(선택한 스냅샷의 초기화 세대와 함께).</summary>
     private void SelectAnt(int id, long resetCount)
     {
         _selectedAntId = id;
         _selectedAntResetCount = resetCount;
+        _host?.SelectAnt(id, resetCount);
     }
 
     private void ClearAntSelection()
     {
         _selectedAntId = -1;
         _selectedAntResetCount = -1;
+        _host?.ClearAntSelection();
+    }
+
+    /// <summary>
+    /// 현재 스냅샷의 감각 상세가 화면의 선택(같은 개미·같은 초기화 세대)과 일치하면 그 상세, 아니면 null.
+    /// 선택 직후 상세가 아직 오지 않았거나 이전 세대의 상세면 표시하지 않는다.
+    /// </summary>
+    private AntSenseDetail? SelectedSenseDetail()
+    {
+        if (_selectedAntId < 0 || _snapshot is not { } s || s.ResetCount != _selectedAntResetCount) return null;
+        var d = s.SelectedAnt;
+        return d.HasValue && d.Id == _selectedAntId && d.ResetCount == _selectedAntResetCount && d.ResetCount == s.ResetCount ? d : null;
+    }
+
+    /// <summary>선택한 개미의 단계 B1 감각 정보 문구.</summary>
+    private string DescribeSense(AntSenseDetail d, long tick)
+    {
+        string head = $"감각 · 세대 {d.ResetCount} · 거리 {d.Distance:0.##}타일 · 좌우 {d.AngleDegrees:0.#}° · 주기 {d.Period:0.###}초";
+        string when = d.HasSensed
+            ? $"마지막 감지: 틱 {d.SenseTick} ({tick - d.SenseTick}틱 전) · 감지 방향 {d.SenseHeading * 180 / MathF.PI:0}° · 다음 감지 {d.SenseTimer:0.00}초 후"
+            : $"마지막 감지: 아직 없음 · 다음 감지 {d.SenseTimer:0.00}초 후";
+        var lines = new List<string> { head, when };
+        if (d.Keys.Count == 0) lines.Add("감지 대상 냄새 없음");
+        string[] sensorNames = { "왼쪽", "정면", "오른쪽" };
+        for (int k = 0; k < d.Keys.Count; k++)
+        {
+            int type = _scentSettings.IndexOf(d.Keys[k]);
+            string name = type >= 0 ? _scentSettings.Types[type].DisplayName : d.Keys[k];
+            if (!d.HasSensed)
+            {
+                lines.Add($"{name}: 감지 전");
+                continue;
+            }
+            var parts = new string[AntPopulation.SensorCount];
+            for (int sensor = 0; sensor < AntPopulation.SensorCount; sensor++)
+                parts[sensor] = (d.SenseFlags & (1 << sensor)) != 0 ? $"{sensorNames[sensor]} 차폐" : $"{sensorNames[sensor]} {d.Value(k, sensor):0.####}";
+            lines.Add($"{name}: {string.Join(" / ", parts)}");
+        }
+        return string.Join("\n", lines);
     }
 
     private string? DescribeSelectedAnt()
@@ -267,7 +308,8 @@ public partial class Main
                $"위치 ({f.X[i]:0.00}, {f.Y[i]:0.00}) · 방향 {degrees:0}°\n" +
                $"기본 속도 {f.BaseSpeed[i]:0.00} 타일/초 · 현재 {f.BaseSpeed[i] * f.SpeedFactor[i]:0.00} (×{f.SpeedFactor[i]:0.00})\n" +
                $"외형 크기 {f.Size[i]:0.00} 타일\n" +
-               "목표·행동·성향·기억: 단계 B~D에서 추가";
+               (SelectedSenseDetail() is { } d ? DescribeSense(d, s.Tick) : "감각: 불러오는 중") + "\n" +
+               "목표·행동·기억: 단계 B2~D에서 추가";
     }
 
     /// <summary>개미 설정을 적용한다: 그 설정으로 초기화(월드·냄새·틱·개미 재생성)하고 화면을 새 세대로 바꾼다.</summary>
@@ -496,7 +538,7 @@ public partial class Main
     }
 
     /// <summary>
-    /// 실험 저장(대화상자·Ctrl+S 공용). 계산 스레드의 명령으로 틱 사이에 저장하며(<see cref="ExperimentSerializer"/>, v2, 임시 파일 교체),
+    /// 실험 저장(대화상자·Ctrl+S 공용). 계산 스레드의 명령으로 틱 사이에 저장하며(<see cref="ExperimentSerializer"/>, v3, 임시 파일 교체),
     /// 저장이 실제로 끝난 뒤에만 성공을 알린다. 성공한 경로는 이후 Ctrl+S 빠른 저장 대상이 된다.
     /// </summary>
     private async Task SaveExperiment(string path)
@@ -522,7 +564,7 @@ public partial class Main
     }
 
     /// <summary>
-    /// Ctrl+S(시뮬레이션 모드): 이 실험을 저장한 적이 있거나 v2 파일에서 불러왔으면 그 파일에 바로 저장, 아니면 저장 대화상자.
+    /// Ctrl+S(시뮬레이션 모드): 이 실험을 저장한 적이 있거나 현재 형식(v3) 파일에서 불러왔으면 그 파일에 바로 저장, 아니면 저장 대화상자.
     /// 맵 파일 경로(<see cref="_currentPath"/>)와는 따로 관리한다.
     /// </summary>
     private void QuickSaveExperiment()
@@ -542,10 +584,15 @@ public partial class Main
             var previous = _host;
             StartSimulation(loaded);
             if (_host is null || _host == previous) return;
-            // v2 파일이면 Ctrl+S가 그 파일에 저장한다. v1 파일은 저장 형식(v2)이 달라지므로 원본을 덮어쓰지 않도록 빠른 저장 대상으로 삼지 않는다.
-            bool v2 = ReadExperimentVersion(path) >= 2;
-            _experimentPath = v2 ? path : null;
-            if (!v2) _simPanel.SetStatus($"v1 실험 파일을 불러왔습니다(개미 없음). 저장하면 새 파일에 v2 형식으로 저장합니다. (틱 {loaded.Tick})");
+            // 현재 형식(v3) 파일이면 Ctrl+S가 그 파일에 저장한다. v1/v2 파일은 저장 형식이 달라지므로 원본을 보존하도록
+            // 빠른 저장 대상으로 삼지 않는다(Ctrl+S는 저장 대화상자를 열어 새 이름으로 v3 저장을 유도).
+            int version = ReadExperimentVersion(path);
+            bool current = version == ExperimentSerializer.CurrentVersion;
+            _experimentPath = current ? path : null;
+            if (!current)
+                _simPanel.SetStatus(version == 1
+                    ? $"v1 실험 파일을 불러왔습니다(개미 없음). 원본은 덮어쓰지 않으며, 저장하면 새 파일에 v{ExperimentSerializer.CurrentVersion} 형식으로 저장합니다. (틱 {loaded.Tick})"
+                    : $"v{version} 실험 파일을 불러왔습니다(감각 상태는 초기값). 원본은 덮어쓰지 않으며, 저장하면 새 파일에 v{ExperimentSerializer.CurrentVersion} 형식으로 저장합니다. (틱 {loaded.Tick})");
         }
         catch (Exception e) when (e is MapFormatException or IOException or UnauthorizedAccessException)
         {

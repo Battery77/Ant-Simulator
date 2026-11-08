@@ -9,6 +9,8 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="AntSim.Core.Tests" />
+    <!-- 감각 벤치마크가 내부 비교 경로(최근접 샘플링)와 감각 패스를 직접 잰다. -->
+    <InternalsVisibleTo Include="AntSim.Benchmarks" />
   </ItemGroup>
 
 </Project>
