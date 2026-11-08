@@ -149,6 +149,9 @@ public sealed class SimulationSession
         return Array.Empty<string>();
     }
 
+    /// <summary>감각 패스가 쓰는 레이어별 냄새 열린 칸(선택한 개미 표시용, 계산 스레드 전용).</summary>
+    internal byte[][] SenseOpenMasks() => _scentSystem.OpenMasks(refresh: true);
+
     /// <summary>월드·냄새·틱을 결합한 상태 해시(재현성 검증용).</summary>
     public ulong ComputeStateHash()
     {

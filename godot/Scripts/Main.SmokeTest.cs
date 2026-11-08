@@ -255,6 +255,7 @@ public partial class Main
                 check(TrySelectAnt(new Vector2(frame.X[target] + 0.2f, frame.Y[target])) && _selectedAntId == id, $"선택 로직으로 개미 #{id} 선택");
             }
             check(DescribeSelectedAnt()?.Contains($"개미 #{id}") == true, "선택한 개미 정보 표시");
+            await SmokeSensing(check, id);
         }
         else
         {
@@ -264,6 +265,65 @@ public partial class Main
         if (ScreenshotPath is { } screenshot && HasDisplay) await CaptureAntScreenshots(screenshot);
         ClearAntSelection();
         _simPanel.SelectHeatmap(HeatmapMode.Single, 0);
+    }
+
+    /// <summary>
+    /// 단계 B1 감각: 선택한 개미의 감각 상세가 같은 세대·같은 틱의 계산 상태와 같고, Inspector와 센서 표시가 나타나며,
+    /// 이전 세대로 보낸 선택 요청은 무시되고, 선택을 풀면 센서 표시가 사라진다.
+    /// </summary>
+    private async Task SmokeSensing(Action<bool, string> check, int id)
+    {
+        var host = _host!;
+        long generation = _snapshot!.ResetCount;
+        // P = 0.3, dt = 0.1: 5틱 안에 모든 개미가 한 번 이상 감지한다. 진행한 틱의 스냅샷을 기다린다.
+        long stepped = await host.RunExclusiveAsync(s => { s.Step(5); return s.Tick; });
+        await WaitUntil(() => _snapshot is { } s && s.Tick == stepped && SelectedSenseDetail() is { HasSensed: true }, "선택한 개미 감각 상세");
+        var d = SelectedSenseDetail()!;
+        check(d.Id == id && d.ResetCount == generation, $"감각 상세의 개미·세대 = 선택 (#{d.Id}, 세대 {d.ResetCount})");
+        var (tick, info, values) = await host.RunExclusiveAsync(s =>
+        {
+            var v = new float[s.Ants.SensedTypeCount * AntPopulation.SensorCount];
+            var sense = s.Ants.GetSense(s.Ants.IndexOfId(id), v);
+            return (s.Tick, sense, v);
+        });
+        bool same = _snapshot.Tick == tick && d.SenseTick == info.SenseTick && d.SenseFlags == info.Flags && d.SenseTimer == info.SenseTimer;
+        for (int j = 0; j < values.Length; j++) same &= d.Values[j] == values[j];
+        check(same, $"감각 상세 = 계산 상태 (틱 {tick}, 감지 틱 {info.SenseTick})");
+        string text = DescribeSelectedAnt() ?? "";
+        check(text.Contains("감각 · 세대") && text.Contains("마지막 감지: 틱") && text.Contains("음식:") && text.Contains("유충:"),
+            $"Inspector 감각 표시: {text.Replace('\n', '|')}");
+        await NextFrame();
+        await NextFrame();
+        check(_antView.ShowingSensors, "선택한 개미 센서 세 점 표시");
+
+        // 정면 센서 칸에 바위를 놓으면(계산 월드) 그 센서가 차폐로 표시된다. 틱을 진행하지 않고 바로 되돌린다.
+        if (await PlaceRockInFront(id) is { } rock)
+        {
+            await WaitUntil(() => SelectedSenseDetail() is { } sd && (sd.SensorPointsBlocked & 0b010) != 0, "정면 센서 차폐 상세");
+            await NextFrame();
+            await NextFrame();
+            check(_antView.BlockedSensorsShown >= 1, $"차폐된 센서 X 표시 (표시 {_antView.BlockedSensorsShown})");
+            await RemoveRock(rock);
+            await WaitUntil(() => SelectedSenseDetail() is { } sd && (sd.SensorPointsBlocked & 0b010) == 0, "바위 제거 후 정면 센서 열림");
+        }
+        else
+        {
+            check(false, "정면 센서 칸에 바위를 놓지 못함");
+        }
+
+        // 이전 세대로 보낸(초기화 뒤 늦게 도착한 것과 같은) 선택 요청은 상세를 채우지 않는다.
+        host.SelectAnt(id, generation - 1);
+        await WaitUntil(() => _snapshot is { } s && s.SelectedAnt.Requested && s.SelectedAnt.ResetCount == generation - 1, "이전 세대 선택 요청 게시");
+        check(!_snapshot!.SelectedAnt.HasValue && SelectedSenseDetail() is null, "이전 세대 선택 요청 거부");
+        host.SelectAnt(id, generation);
+        await WaitUntil(() => SelectedSenseDetail() is not null, "선택 복원");
+
+        ClearAntSelection();
+        await NextFrame();
+        await NextFrame();
+        check(!_antView.ShowingSensors && DescribeSelectedAnt() is null, "선택 해제 → 센서 표시 사라짐");
+        SelectAnt(id, generation);
+        await WaitUntil(() => SelectedSenseDetail() is not null, "다시 선택");
     }
 
     /// <summary>
@@ -402,6 +462,8 @@ public partial class Main
         await host.RunExclusiveAsync(s => { new MapEditor(s.World).Apply(EditOp.SetTerrain(LayerId.Surface, 9, 9, Terrain.Water)); s.Step(20); return true; });
         await ResetSimulation();
         check(_selectedAntId == -1 && DescribeSelectedAnt() is null, "초기화 후 개미 선택 해제");
+        await NextFrame();
+        check(!_antView.ShowingSensors && SelectedSenseDetail() is null, "초기화 후 센서 표시·감각 상세 사라짐");
         check(_minResetCount == generation + 1, $"초기화 세대 증가 ({_minResetCount})");
         ulong computed = await host.RunExclusiveAsync(s => s.World.ComputeContentHash());
         check(_simWorld!.ComputeContentHash() == computed && ReferenceEquals(_view.DisplayedWorld, _simWorld), "초기화 후 화면 월드 = 계산 월드");
@@ -611,7 +673,7 @@ public partial class Main
     /// <summary>
     /// 실험 저장 UX(시뮬레이션 모드): Ctrl+S(경로 없음 → 저장 대화상자, 취소 → 저장·성공 알림 없음), 대화상자로 새 파일 저장 → 성공 알림·빠른 저장 경로,
     /// Ctrl+S 빠른 저장, 기존 파일 덮어쓰기 확인(취소 → 파일 그대로, 확인 → 덮어씀), 대화상자가 열린 동안 단축키 무시, 저장 실패 알림,
-    /// v1 파일을 불러온 뒤 Ctrl+S는 원본을 덮어쓰지 않음, 연속 저장.
+    /// v1·v2 파일을 불러온 뒤 Ctrl+S는 원본을 덮어쓰지 않음, 연속 저장.
     /// </summary>
     private async Task SmokeExperimentSaveUx(Action<bool, string> check)
     {
@@ -705,9 +767,22 @@ public partial class Main
         await NextFrame();
         check(System.IO.File.ReadAllBytes(v1).SequenceEqual(v1Bytes), "v1 원본 파일 그대로");
 
-        // v2 파일을 불러오면 그 파일이 빠른 저장 대상
+        // v2 실험 파일(B0 고정 파일)도 저장 형식(v3)과 달라 원본을 덮어쓰지 않는다.
+        string v2Fixture = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(fixture)!, "experiment-v2-stagea.antexp");
+        string v2 = System.IO.Path.Combine(dir, "old-v2.antexp");
+        System.IO.File.Copy(v2Fixture, v2);
+        byte[] v2Bytes = System.IO.File.ReadAllBytes(v2);
+        LoadExperiment(v2);
+        check(_host is not null && _experimentPath is null, "v2 파일은 빠른 저장 대상이 아님");
+        await PressCtrlS();
+        check(_modal is FileDialog, "v2 불러온 뒤 Ctrl+S → 저장 대화상자(원본 덮어쓰기 안 함)");
+        (_modal as FileDialog)?.GetCancelButton().EmitSignal(BaseButton.SignalName.Pressed);
+        await NextFrame();
+        check(System.IO.File.ReadAllBytes(v2).SequenceEqual(v2Bytes), "v2 원본 파일 그대로");
+
+        // 현재 형식(v3) 파일을 불러오면 그 파일이 빠른 저장 대상
         LoadExperiment(first);
-        check(_experimentPath == first, "v2 파일은 불러온 뒤 빠른 저장 대상");
+        check(_experimentPath == first, "v3 파일은 불러온 뒤 빠른 저장 대상");
         System.IO.Directory.Delete(dir, true);
     }
 
@@ -853,6 +928,90 @@ public partial class Main
             }
             await SaveScreenshot(path.Replace(".png", $"-ants-t{tick}.png"));
         }
+        await CaptureSenseScreenshots(path);
+    }
+
+    /// <summary>
+    /// 선택한 개미(지상)의 정면 1타일 칸에 바위를 놓는다(계산 월드와 화면 월드 모두). 개미가 서 있는 칸이면 놓지 않는다. 놓은 칸 또는 null.
+    /// main에도 있는 API만 쓴다(변경 전 캡처와 같은 시나리오).
+    /// </summary>
+    private async Task<(int X, int Y)?> PlaceRockInFront(int id)
+    {
+        var g = _snapshot!.Ants;
+        int i = Array.IndexOf(g.Id, id, 0, g.Count);
+        if (i < 0 || g.Layer[i] != (byte)LayerId.Surface) return null;
+        var (sin, cos) = MathF.SinCos(g.Heading[i]);
+        int fx = (int)MathF.Floor(g.X[i] + cos), fy = (int)MathF.Floor(g.Y[i] + sin);
+        for (int j = 0; j < g.Count; j++)
+            if (g.Layer[j] == (byte)LayerId.Surface && (int)MathF.Floor(g.X[j]) == fx && (int)MathF.Floor(g.Y[j]) == fy) return null;
+        var op = EditOp.PlaceSolid(LayerId.Surface, fx, fy, SolidBlock.Rock);
+        bool placed = await _host!.RunExclusiveAsync(s => new MapEditor(s.World).Apply(op).Changed);
+        if (!placed) return null;
+        new MapEditor(_simWorld!).Apply(op);
+        _view.SetWorld(_simWorld!);
+        return (fx, fy);
+    }
+
+    private async Task RemoveRock((int X, int Y) rock)
+    {
+        var op = EditOp.RemoveSolid(LayerId.Surface, rock.X, rock.Y);
+        await _host!.RunExclusiveAsync(s => new MapEditor(s.World).Apply(op).Changed);
+        new MapEditor(_simWorld!).Apply(op);
+        _view.SetWorld(_simWorld!);
+    }
+
+    /// <summary>
+    /// 감각 캡처: 음식 히트맵(지상)을 켜고, 지상 개미 중 음식 냄새가 가장 진한 칸에 있는 개미를 골라 확대해 서로 다른 두 틱에서 찍는다.
+    /// 변경 전(main)과 같은 시나리오로 찍을 수 있도록 main에도 있는 API만 쓴다.
+    /// </summary>
+    private async Task CaptureSenseScreenshots(string path)
+    {
+        var host = _host!;
+        SetLayer(LayerId.Surface);
+        _simPanel.SelectHeatmap(HeatmapMode.Single, 0);
+        long start = await host.RunExclusiveAsync(s => s.Tick);
+        await WaitUntil(() => _snapshot is { } s && s.Tick == start && s.Layer == LayerId.Surface && s.Contains(0), "감각 캡처용 음식 히트맵");
+        var snap = _snapshot!;
+        var f = snap.Ants;
+        int best = -1;
+        float bestScent = -1;
+        for (int i = 0; i < f.Count; i++)
+        {
+            if (f.Layer[i] != (byte)LayerId.Surface) continue;
+            float v = snap.Field(0)[_simWorld!.Config.ToLinearIndex((int)f.X[i], (int)f.Y[i])];
+            if (v > bestScent) { bestScent = v; best = i; }
+        }
+        if (best < 0) return;
+        int id = f.Id[best];
+        SelectAnt(id, snap.ResetCount);
+        foreach (int step in new[] { 0, 12 })
+        {
+            long target = start + step;
+            await host.RunExclusiveAsync(s => { s.Step((int)(target - s.Tick)); return true; });
+            await WaitUntil(() => _snapshot is { } s && s.Tick == target, $"감각 캡처 틱 {target}");
+            await Wait(0.1);
+            var g = _snapshot!.Ants;
+            int i = Array.IndexOf(g.Id, id, 0, g.Count);
+            if (i >= 0)
+            {
+                _camera.FitTo(new Rect2(g.X[i] - 7, g.Y[i] - 4, 14, 8));
+                _camera.Position -= new Vector2(2, 0);
+            }
+            for (int f2 = 0; f2 < 3; f2++) await NextFrame();
+            _simPanel.ScrollToEnd(); // 정보 칸(선택한 개미)이 보이도록
+            await SaveScreenshot(path.Replace(".png", $"-sense-t{target}.png"));
+            _simPanel.ScrollToStart();
+        }
+        // 정면에 바위를 놓은 장면(차폐 표시). 틱은 진행하지 않고, 찍은 뒤 바위를 치운다.
+        if (await PlaceRockInFront(id) is { } rock)
+        {
+            await Wait(0.3);
+            for (int f2 = 0; f2 < 3; f2++) await NextFrame();
+            _simPanel.ScrollToEnd();
+            await SaveScreenshot(path.Replace(".png", "-sense-blocked.png"));
+            _simPanel.ScrollToStart();
+            await RemoveRock(rock);
+        }
     }
 
     /// <summary>
@@ -863,11 +1022,25 @@ public partial class Main
     {
         // 현재 월드만 바꾼 실험 파일을 정상 저장 경로로 만든다.
         string path = ProjectSettings.GlobalizePath("user://smoke-diverged.antexp");
+        // 물·바위를 놓을 두 칸은 개미가 서 있지 않은 곳을 고른다(개미가 선 칸을 막으면 저장 전 검사가 그 상태를 거부한다).
+        int wx = await _host!.RunExclusiveAsync(s =>
+        {
+            for (int x = 3; ; x += 2)
+            {
+                bool occupied = false;
+                for (int i = 0; i < s.Ants.Count; i++)
+                {
+                    var a = s.Ants.Get(i);
+                    occupied |= a.Layer == LayerId.Surface && a.TileY == 3 && (a.TileX == x || a.TileX == x + 1);
+                }
+                if (!occupied) return x;
+            }
+        });
         await _host!.RunExclusiveAsync(s =>
         {
             var editor = new MapEditor(s.World);
-            editor.Apply(EditOp.SetTerrain(LayerId.Surface, 3, 3, Terrain.Water));
-            editor.Apply(EditOp.PlaceSolid(LayerId.Surface, 4, 3, SolidBlock.Rock));
+            editor.Apply(EditOp.SetTerrain(LayerId.Surface, wx, 3, Terrain.Water));
+            editor.Apply(EditOp.PlaceSolid(LayerId.Surface, wx + 1, 3, SolidBlock.Rock));
             editor.Apply(EditOp.SetQuantity(LayerId.Surface, 12, 12, QuantityKind.Food, 9));
             ExperimentSerializer.Save(s, path);
             return true;
@@ -883,7 +1056,7 @@ public partial class Main
         check(computed == initial, "초기화 후 계산 월드 = 시작 월드");
         check(_simWorld!.ComputeContentHash() == computed, "초기화 후 화면 월드(_simWorld) = 계산 월드");
         check(ReferenceEquals(_view.DisplayedWorld, _simWorld), "초기화 후 MapView가 새 화면 월드를 그림");
-        check(EditorText.DescribeTile(_simWorld!, LayerId.Surface, 3, 3).Contains("지형: 흙"), "초기화 후 타일 정보가 시작 월드 기준");
+        check(EditorText.DescribeTile(_simWorld!, LayerId.Surface, wx, 3).Contains("지형: 흙"), "초기화 후 타일 정보가 시작 월드 기준");
         await StepOnce();
         float food = await host.RunExclusiveAsync(s => s.Scent.Get(0, LayerId.Surface, 12, 12));
         check(food == 0f, "초기화 후 다음 틱 발생원이 시작 월드 기준(현재 월드에만 있던 먹이 없음)");

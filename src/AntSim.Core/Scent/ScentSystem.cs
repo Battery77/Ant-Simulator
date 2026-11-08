@@ -47,14 +47,17 @@ public sealed class ScentSystem
     public World World => _world;
 
     /// <summary>
-    /// 레이어별 냄새 열린 칸(1 = 비고체) 캐시. 감각 패스(<see cref="Ants.AntSensing"/>)가 읽는다. 캐시를 월드와 맞춘 뒤 돌려준다
-    /// (냄새 틱이 이미 맞춰 두었으면 바뀐 청크가 없어 비용이 거의 없다). 반환 배열은 읽기 전용으로 쓴다.
+    /// 레이어별 냄새 열린 칸(1 = 비고체) 캐시. 감각 패스(<see cref="Ants.AntSensing"/>)가 읽는다. 반환 배열은 읽기 전용으로 쓴다.
+    /// 캐시는 <see cref="Tick"/>이 매번 월드와 맞추며, 감각 패스는 같은 틱의 냄새 계산 직후에 실행되므로 다시 맞추지 않는다(추가 할당·순회 없음).
+    /// 아직 한 번도 맞추지 않았거나 <paramref name="refresh"/>가 true면 지금 맞춘다(첫 틱 전 표시용 등).
     /// </summary>
-    internal byte[][] OpenMasks()
+    internal byte[][] OpenMasks(bool refresh = false)
     {
-        RefreshCaches();
+        if (refresh || !_cachesReady) RefreshCaches();
         return _open;
     }
+
+    private bool _cachesReady;
 
     public void Tick(ScentState state, ScentSettings settings)
     {
@@ -210,6 +213,7 @@ public sealed class ScentSystem
     /// <summary>바뀐 청크의 고체/수량 정보와 통로 목록을 레이어 전체 배열 캐시에 반영한다.</summary>
     private void RefreshCaches()
     {
+        _cachesReady = true;
         var config = _world.Config;
         foreach (var layer in _world.Layers)
         {
