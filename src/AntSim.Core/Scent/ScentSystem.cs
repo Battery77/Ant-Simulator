@@ -46,6 +46,16 @@ public sealed class ScentSystem
 
     public World World => _world;
 
+    /// <summary>
+    /// 레이어별 냄새 열린 칸(1 = 비고체) 캐시. 감각 패스(<see cref="Ants.AntSensing"/>)가 읽는다. 캐시를 월드와 맞춘 뒤 돌려준다
+    /// (냄새 틱이 이미 맞춰 두었으면 바뀐 청크가 없어 비용이 거의 없다). 반환 배열은 읽기 전용으로 쓴다.
+    /// </summary>
+    internal byte[][] OpenMasks()
+    {
+        RefreshCaches();
+        return _open;
+    }
+
     public void Tick(ScentState state, ScentSettings settings)
     {
         if (state.TypeCount != settings.Types.Count)

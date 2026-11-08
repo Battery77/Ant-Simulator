@@ -82,6 +82,83 @@ public sealed record AntSettings
     /// </summary>
     public float PassageUseProbability { get; init; } = 0.5f;
 
+    // ---------- 단계 B: 감각·경로 적분 설정 (docs/STAGE_B_DESIGN.md C.1) ----------
+
+    /// <summary>감지 주기 상한(초).</summary>
+    public const float MaxSensePeriodSeconds = 60f;
+
+    /// <summary>센서 거리 상한(타일). 차폐 DDA의 칸 조회 수를 2⌈d⌉ + 1(= 5) 이하로 묶는다.</summary>
+    public const float MaxSensorDistance = 2f;
+
+    /// <summary>좌우 센서 각도 상한(도). 좌우 센서가 개미 뒤쪽으로 가지 않는다.</summary>
+    public const float MaxSensorAngleDegrees = 90f;
+
+    /// <summary>경로 적분 오차 σ 상한(타일당 축별 표준편차 계수).</summary>
+    public const float MaxPathErrorSigma = 10f;
+
+    /// <summary>동시에 감지할 수 있는 냄새 종류 수 상한(K = 0~8).</summary>
+    public const int MaxSensedTypes = 8;
+
+    /// <summary><see cref="SensedScentKeys"/>가 null(기본 규칙)일 때 감지 후보. 현재 냄새 설정에 있는 키만, 이 순서로 쓴다.</summary>
+    public static IReadOnlyList<string> DefaultSensedScentKeys { get; } = new[] { "food", "larva" };
+
+    /// <summary>감지 주기(시뮬레이션 시간, 초). 개미마다 id 기반 위상으로 분산된다.</summary>
+    public float SensePeriodSeconds { get; init; } = 0.3f;
+
+    /// <summary>개미 위치에서 센서까지의 거리(타일).</summary>
+    public float SensorDistance { get; init; } = 1f;
+
+    /// <summary>좌우 센서 각도(도). 왼쪽 = Heading − 각도, 오른쪽 = Heading + 각도.</summary>
+    public float SensorAngleDegrees { get; init; } = 45f;
+
+    /// <summary>
+    /// 감지할 냄새 키 목록. null이면 기본 규칙(<see cref="DefaultSensedScentKeys"/> 중 냄새 설정에 있는 키만, K = 0~2).
+    /// 명시 목록은 모든 키가 냄새 설정에 있어야 하며(없으면 세션 생성·초기화가 거부된다), 감지 값 배열 순서가 된다.
+    /// </summary>
+    public IReadOnlyList<string>? SensedScentKeys { get; init; }
+
+    /// <summary>경로 적분 오차 σ(단계 B2에서 사용, B1에서는 저장만 한다).</summary>
+    public float PathErrorSigma { get; init; } = 0.14f;
+
+    /// <summary>
+    /// 감지 키를 냄새 설정에 맞춰 해석한다(세션 생성·초기화·불러오기 때 한 번). 성공하면 키와 냄새 종류 인덱스(감지 값 배열 순서),
+    /// 실패하면 오류 문구. 키 목록 자체의 규칙(개수·빈 키·중복)은 <see cref="Validate"/>가 먼저 확인한다.
+    /// </summary>
+    public bool TryResolveSensedScentKeys(Scent.ScentSettings scent, out string[] keys, out int[] typeIndices, out string? error)
+    {
+        ArgumentNullException.ThrowIfNull(scent);
+        var resolvedKeys = new List<string>();
+        var resolvedIndices = new List<int>();
+        error = null;
+        if (SensedScentKeys is null)
+        {
+            foreach (string key in DefaultSensedScentKeys)
+            {
+                int index = scent.IndexOf(key);
+                if (index < 0) continue; // 기본 규칙: 없는 기본 키는 쓰지 않는다
+                resolvedKeys.Add(key);
+                resolvedIndices.Add(index);
+            }
+        }
+        else
+        {
+            foreach (string key in SensedScentKeys)
+            {
+                int index = key is null ? -1 : scent.IndexOf(key);
+                if (index < 0)
+                {
+                    error = $"감지할 냄새 키 '{key}'가 냄새 설정에 없습니다.";
+                    break;
+                }
+                resolvedKeys.Add(key!);
+                resolvedIndices.Add(index);
+            }
+        }
+        keys = error is null ? resolvedKeys.ToArray() : Array.Empty<string>();
+        typeIndices = error is null ? resolvedIndices.ToArray() : Array.Empty<int>();
+        return error is null;
+    }
+
     public float SpeedFactorFor(int quantity)
     {
         // 개미마다 매 틱 호출되므로 인터페이스 foreach(열거자 할당)를 쓰지 않는다.
@@ -123,6 +200,25 @@ public sealed record AntSettings
         Positive(errors, "회전 속도", TurnRateDegreesPerSecond);
         if (!(SpeedFactorSmoothingSeconds >= 0) || float.IsInfinity(SpeedFactorSmoothingSeconds)) errors.Add("감속 완화 시간은 0 이상이어야 합니다.");
         if (!(PassageUseProbability >= 0 && PassageUseProbability <= 1)) errors.Add("통로 이용 확률은 0~1이어야 합니다.");
+
+        if (!(SensePeriodSeconds > 0 && SensePeriodSeconds <= MaxSensePeriodSeconds))
+            errors.Add($"감지 주기는 0초 초과 {MaxSensePeriodSeconds}초 이하여야 합니다 (현재 {SensePeriodSeconds}).");
+        if (!(SensorDistance > 0 && SensorDistance <= MaxSensorDistance))
+            errors.Add($"센서 거리는 0타일 초과 {MaxSensorDistance}타일 이하여야 합니다 (현재 {SensorDistance}).");
+        if (!(SensorAngleDegrees > 0 && SensorAngleDegrees <= MaxSensorAngleDegrees))
+            errors.Add($"센서 각도는 0도 초과 {MaxSensorAngleDegrees}도 이하여야 합니다 (현재 {SensorAngleDegrees}).");
+        if (!(PathErrorSigma >= 0 && PathErrorSigma <= MaxPathErrorSigma))
+            errors.Add($"경로 적분 오차 σ는 0 이상 {MaxPathErrorSigma} 이하여야 합니다 (현재 {PathErrorSigma}).");
+        if (SensedScentKeys is { } sensed)
+        {
+            if (sensed.Count > MaxSensedTypes) errors.Add($"감지할 냄새 종류는 {MaxSensedTypes}개 이하여야 합니다 (현재 {sensed.Count}).");
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (string key in sensed)
+            {
+                if (string.IsNullOrEmpty(key)) errors.Add("감지할 냄새 키가 비어 있습니다.");
+                else if (!seen.Add(key)) errors.Add($"감지할 냄새 키 '{key}'가 중복됩니다.");
+            }
+        }
 
         if (QuantitySpeedTiers.Count > MaxSpeedTiers)
             errors.Add($"속도 구간은 {MaxSpeedTiers}개 이하여야 합니다 (현재 {QuantitySpeedTiers.Count}).");
