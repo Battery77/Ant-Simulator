@@ -127,11 +127,13 @@ public class AntSimulationTests
         Assert.Equal(0.7, session.ElapsedSeconds, 9);
         Assert.Equal(1488237037508684556UL, session.World.ComputeContentHash());
         Assert.Equal(1488237037508684556UL, session.InitialWorld.ComputeContentHash());
-        Assert.Equal(11466948791231909576UL, session.Scent.ComputeHash());
+        // 냄새 해시 2개는 냄새 저장 방식 변경(v1 원래 해상도 → 지상 묶음 칸 평균·개미집 열린 칸 변환, docs/PERF_SCENT_DESIGN.md P-6)으로
+        // 다시 고정했다. 이전 값: 11466948791231909576(불러온 직후), 8932635140070662969(5틱 뒤). 월드 해시는 그대로다.
+        Assert.Equal(603500848868693068UL, session.Scent.ComputeHash());
         Assert.Equal(0, session.Ants.Count);
         Assert.Equal(0, session.AntSettings.InitialCount);
         session.Step(5);
-        Assert.Equal(8932635140070662969UL, session.Scent.ComputeHash());
+        Assert.Equal(12587884564989796061UL, session.Scent.ComputeHash());
     }
 
     [Fact]

@@ -174,7 +174,7 @@ public class SimulationHostTests
         Assert.NotNull(snapshot);
         Assert.Equal(1, snapshot!.TypeIndex);
         Assert.Equal(LayerId.Nest, snapshot.Layer);
-        var expected = await host.RunExclusiveAsync(s => s.Scent.Field(1, LayerId.Nest).ToArray()).WaitAsync(Timeout);
+        var expected = await host.RunExclusiveAsync(s => ScentDisplay.Of(s.Scent, 1, LayerId.Nest)).WaitAsync(Timeout);
         Assert.Equal(expected, snapshot.Data);
         Assert.Equal(expected.Max(), snapshot.Max);
         host.Release(snapshot);

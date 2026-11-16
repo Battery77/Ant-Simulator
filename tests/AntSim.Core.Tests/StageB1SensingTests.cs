@@ -19,6 +19,10 @@ public class StageB1SensingTests(ITestOutputHelper output)
 
     // ---------- 도구 ----------
 
+    /// <summary>
+    /// 감각 시험 장치. 칸 단위 값을 다루는 시험은 원래 해상도인 개미집 레이어를 기본으로 쓴다(지상 냄새는 묶음 격자라 칸마다 값을 둘 수 없다,
+    /// docs/PERF_SCENT_DESIGN.md). 지상 묶음 칸 읽기는 <see cref="Surface_SensorReadsTheCoarseCellOfItsTile"/>가 검사한다.
+    /// </summary>
     private sealed class Rig
     {
         public World World = null!;
@@ -37,24 +41,22 @@ public class StageB1SensingTests(ITestOutputHelper output)
             return rig;
         }
 
-        public void Solid(int x, int y, LayerId layer = LayerId.Surface) =>
+        public void Solid(int x, int y, LayerId layer = LayerId.Nest) =>
             Assert.Equal(WorldError.None, World.GetLayer(layer).TrySetState(x, y, Rock));
 
-        public void Wet(int x, int y) => Assert.Equal(WorldError.None, World.Surface.TrySetState(x, y, Water));
+        public void Wet(int x, int y, LayerId layer = LayerId.Nest) => Assert.Equal(WorldError.None, World.GetLayer(layer).TrySetState(x, y, Water));
 
-        public void Set(int type, int x, int y, float value, LayerId layer = LayerId.Surface) =>
-            State.MutableField(type, layer)[y * World.Config.Width + x] = value;
+        public void Set(int type, int x, int y, float value, LayerId layer = LayerId.Nest) => Assert.True(State.Set(type, layer, x, y, value));
 
-        public void Fill(int type, Func<int, int, float> value, LayerId layer = LayerId.Surface)
+        public void Fill(int type, Func<int, int, float> value, LayerId layer = LayerId.Nest)
         {
-            var field = State.MutableField(type, layer);
             for (int y = 0; y < World.Config.Height; y++)
             for (int x = 0; x < World.Config.Width; x++)
-                field[y * World.Config.Width + x] = value(x, y);
+                State.Set(type, layer, x, y, value(x, y));
         }
 
         /// <summary>개미 한 마리를 놓고(방향 지정) 바로 다음 감각 패스에서 감지하게 한 뒤 한 번 감지한다. 개미 인덱스를 돌려준다.</summary>
-        public int SenseOne(float x, float y, float heading, LayerId layer = LayerId.Surface)
+        public int SenseOne(float x, float y, float heading, LayerId layer = LayerId.Nest)
         {
             Config = AntSensingConfig.Create(Settings, Scent);
             Ants = new AntPopulation();
@@ -156,11 +158,26 @@ public class StageB1SensingTests(ITestOutputHelper output)
     {
         var rig = Rig.Create();
         rig.Fill(0, (_, _) => 5f, LayerId.Nest); // 개미집 레이어에만 냄새
-        rig.World.Nest.FillUnchecked(TilePlane.Solid, 0);
-        int i = rig.SenseOne(8.5f, 8.5f, 0);
+        int i = rig.SenseOne(8.5f, 8.5f, 0, LayerId.Surface);
         for (int d = 0; d < 3; d++) Assert.Equal(0f, rig.Value(i, 0, d));
         i = rig.SenseOne(8.5f, 8.5f, 0, LayerId.Nest);
         for (int d = 0; d < 3; d++) Assert.Equal(5f, rig.Value(i, 0, d), Tolerance);
+    }
+
+    /// <summary>지상: 센서 칸이 속한 묶음 칸(F×F) 값을 읽는다. 벽 판정은 원래 해상도 칸으로 한다.</summary>
+    [Fact]
+    public void Surface_SensorReadsTheCoarseCellOfItsTile()
+    {
+        const int F = ScentGrid.SurfaceCellSize;
+        var rig = Rig.Create(32, 32);
+        rig.Fill(0, (x, y) => 100 * (x / F) + y / F, LayerId.Surface); // 묶음 칸 (cx, cy) = 100·cx + cy
+        rig.Solid(13, 9, LayerId.Surface);
+        int i = rig.SenseOne(9.5f, 9.5f, 0, LayerId.Surface); // 정면 (10.5, 9.5) → 칸 (10,9) → 묶음 칸 (2,2)
+        Assert.Equal(202f, rig.Value(i, 0, Front));
+        Assert.False(rig.Info(i).IsBlocked(Front));
+        i = rig.SenseOne(12.5f, 9.5f, 0, LayerId.Surface); // 정면 칸 (13,9)는 바위 → 같은 묶음 칸 (3,2)에 열린 칸이 있어도 차폐
+        Assert.True(rig.Info(i).IsBlocked(Front));
+        Assert.Equal(0f, rig.Value(i, 0, Front));
     }
 
     // ---------- 4·5·6. 키 해석, K = 0/1/2/8, 잘못된 키 ----------
@@ -398,13 +415,13 @@ public class StageB1SensingTests(ITestOutputHelper output)
     [Fact]
     public void ScentThatDiffusedAroundAWall_IsSensed_ButNotThroughTheWall()
     {
-        // 벽 x = 8 (y 0..11), 아래쪽 y ≥ 12는 열림. 먹이는 벽 오른쪽 (12, 4). 냄새는 틈을 돌아 왼쪽에 도달한다.
+        // 개미집, 벽 x = 8 (y 0..11), 아래쪽 y ≥ 12는 열림. 먹이는 벽 오른쪽 (12, 4). 냄새는 틈을 돌아 왼쪽에 도달한다.
         var rig = Rig.Create();
         for (int y = 0; y < 12; y++) rig.Solid(8, y);
-        Assert.Equal(WorldError.None, rig.World.Surface.TrySetState(12, 4, new TileState(Terrain.Dirt, SolidBlock.None, 9, 0)));
+        Assert.Equal(WorldError.None, rig.World.Nest.TrySetState(12, 4, new TileState(Terrain.Dirt, SolidBlock.None, 9, 0)));
         var system = new ScentSystem(rig.World);
         for (int t = 0; t < 600; t++) system.Tick(rig.State, rig.Scent);
-        float around = rig.State.Get(0, LayerId.Surface, 7, 4);
+        float around = rig.State.Get(0, LayerId.Nest, 7, 4);
         Assert.True(around > 0, "냄새가 벽을 돌아 왼쪽에 도달해야 한다");
 
         int i = rig.SenseOne(6.5f, 4.5f, 0); // 센서 (7.5, 4.5): 벽 앞 열린 칸
@@ -412,7 +429,7 @@ public class StageB1SensingTests(ITestOutputHelper output)
         Assert.True(rig.Value(i, 0, Front) > 0);
         i = rig.SenseOne(7.5f, 4.5f, 0); // 센서 (8.5, 4.5): 벽
         Assert.True(rig.Info(i).IsBlocked(Front));
-        Assert.True(rig.State.Get(0, LayerId.Surface, 9, 4) > around); // 벽 너머가 더 진하지만 읽지 않는다
+        Assert.True(rig.State.Get(0, LayerId.Nest, 9, 4) > around); // 벽 너머가 더 진하지만 읽지 않는다
     }
 
     // ---------- 14. 물, 맵 경계 ----------

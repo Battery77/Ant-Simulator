@@ -28,3 +28,14 @@ internal static class TestWorlds
         }
     }
 }
+
+internal static class ScentDisplay
+{
+    /// <summary>스냅샷과 같은 표시 격자로 펼친 냄새 필드(지상 묶음 격자 그대로, 개미집은 W·H에 열린 칸 값, 나머지 0).</summary>
+    public static float[] Of(Scent.ScentState state, int type, LayerId layer)
+    {
+        var display = new float[state.Grid(layer).DisplayLength];
+        state.ExpandTo(type, layer, display);
+        return display;
+    }
+}

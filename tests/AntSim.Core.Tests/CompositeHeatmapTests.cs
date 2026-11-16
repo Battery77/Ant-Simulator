@@ -345,7 +345,7 @@ public class HeatmapSelectionTests
         host.SelectHeatmap(new[] { 0, 1 }, LayerId.Nest);
         var snapshot = await WaitSnapshot(host, s => s.Types.Count == 2 && s.Layer == LayerId.Nest);
         var (food, larva) = await host.RunExclusiveAsync(s =>
-            (s.Scent.Field(0, LayerId.Nest).ToArray(), s.Scent.Field(1, LayerId.Nest).ToArray())).WaitAsync(Timeout);
+            (ScentDisplay.Of(s.Scent, 0, LayerId.Nest), ScentDisplay.Of(s.Scent, 1, LayerId.Nest))).WaitAsync(Timeout);
         Assert.Equal(food, snapshot.Field(0));
         Assert.Equal(larva, snapshot.Field(1));
         Assert.Equal(food.Max(), snapshot.MaxOf(0));
@@ -366,7 +366,7 @@ public class HeatmapSelectionTests
 
         host.SelectHeatmap(new[] { 0, 1 }, LayerId.Nest);
         var nest = await WaitSnapshot(host, s => s.Layer == LayerId.Nest && s.Types.Count == 2);
-        var expected = await host.RunExclusiveAsync(s => s.Scent.Field(1, LayerId.Nest).ToArray()).WaitAsync(Timeout);
+        var expected = await host.RunExclusiveAsync(s => ScentDisplay.Of(s.Scent, 1, LayerId.Nest)).WaitAsync(Timeout);
         Assert.Equal(expected, nest.Field(1));
         Assert.NotEqual(surfaceLarva, nest.Field(1));
         host.Release(nest);

@@ -4,8 +4,13 @@ using AntSim.Core.Worlds;
 
 namespace AntSim.Core.Tests;
 
+/// <summary>
+/// 냄새 계산(docs/PERF_SCENT_DESIGN.md). 원래 해상도 물리(확산 공식·벽·발생·순서)는 개미집 레이어(열린 칸 압축, 1칸 = 1값)에서,
+/// 지상은 묶음 격자(F×F칸 = 1값) 규칙으로 검사한다. TestWorlds.Create는 두 레이어 모두 열린 빈 월드다.
+/// </summary>
 public class ScentSystemTests
 {
+    private const int F = ScentGrid.SurfaceCellSize;
     private const LayerId S = LayerId.Surface;
     private const LayerId N = LayerId.Nest;
 
@@ -19,8 +24,9 @@ public class ScentSystemTests
         return (world, new ScentSystem(world), new ScentState(world.Config, settings.Types.Count));
     }
 
+    /// <summary>칸 (x, y)의 저장 값에 쓴다(지상은 그 칸이 속한 묶음 칸 전체).</summary>
     private static void Put(ScentState state, LayerId layer, int x, int y, float value) =>
-        state.MutableField(0, layer)[state.Config.ToLinearIndex(x, y)] = value;
+        Assert.True(state.Set(0, layer, x, y, value));
 
     // ---- 설정 검증 ----
 
@@ -86,22 +92,22 @@ public class ScentSystemTests
     {
         var settings = Single();
         var (_, system, state) = Setup(9, 9, settings);
-        Put(state, S, 4, 4, 100);
+        Put(state, N, 4, 4, 100);
         system.Tick(state, settings);
 
-        Near.Equal(100f - 4 * 0.06f * 100f, state.Get(0, S, 4, 4), 4);
+        Near.Equal(100f - 4 * 0.06f * 100f, state.Get(0, N, 4, 4), 4);
         foreach (var (x, y) in new[] { (3, 4), (5, 4), (4, 3), (4, 5) })
-            Near.Equal(6f, state.Get(0, S, x, y), 4);
-        Assert.Equal(0f, state.Get(0, S, 3, 3));
+            Near.Equal(6f, state.Get(0, N, x, y), 4);
+        Assert.Equal(0f, state.Get(0, N, 3, 3));
 
         for (int i = 0; i < 20; i++) system.Tick(state, settings);
         for (int y = 0; y < 9; y++)
         for (int x = 0; x < 9; x++)
         {
             // 물리적으로 대칭이지만 이웃 합산 순서가 달라 float 마지막 자리는 다를 수 있다.
-            float v = state.Get(0, S, x, y);
-            Assert.True(Math.Abs(v - state.Get(0, S, 8 - x, y)) <= 1e-6f * Math.Max(1f, v));
-            Assert.True(Math.Abs(v - state.Get(0, S, y, x)) <= 1e-6f * Math.Max(1f, v));
+            float v = state.Get(0, N, x, y);
+            Assert.True(Math.Abs(v - state.Get(0, N, 8 - x, y)) <= 1e-6f * Math.Max(1f, v));
+            Assert.True(Math.Abs(v - state.Get(0, N, y, x)) <= 1e-6f * Math.Max(1f, v));
         }
     }
 
@@ -125,14 +131,14 @@ public class ScentSystemTests
         // 바위 벽(x = 5)으로 나뉜 맵: 오른쪽으로는 냄새가 넘어가지 않는다.
         var settings = Single();
         var (world, system, state) = Setup(11, 5, settings);
-        for (int y = 0; y < 5; y++) world.Surface.TrySetState(5, y, new TileState(Terrain.Dirt, SolidBlock.Rock, 0, 0));
-        Put(state, S, 2, 2, 100);
+        for (int y = 0; y < 5; y++) world.Nest.TrySetState(5, y, new TileState(Terrain.Dirt, SolidBlock.Rock, 0, 0));
+        Put(state, N, 2, 2, 100);
         for (int i = 0; i < 500; i++) system.Tick(state, settings);
 
         for (int y = 0; y < 5; y++)
         {
-            Assert.Equal(0f, state.Get(0, S, 5, y));
-            for (int x = 6; x < 11; x++) Assert.Equal(0f, state.Get(0, S, x, y));
+            Assert.Equal(0f, state.Get(0, N, 5, y));
+            for (int x = 6; x < 11; x++) Assert.Equal(0f, state.Get(0, N, x, y));
         }
         Assert.Equal(100, state.Total(0), 2);
     }
@@ -142,11 +148,12 @@ public class ScentSystemTests
     {
         var settings = Single();
         var (world, system, state) = Setup(5, 5, settings);
-        Put(state, S, 2, 2, 50);
-        world.Surface.TrySetState(2, 2, new TileState(Terrain.Dirt, SolidBlock.Soil, 0, 0));
+        Put(state, N, 2, 2, 50);
+        world.Nest.TrySetState(2, 2, new TileState(Terrain.Dirt, SolidBlock.Soil, 0, 0));
         system.Tick(state, settings);
-        Assert.Equal(0f, state.Get(0, S, 2, 2));
-        Assert.Equal(0f, state.Get(0, S, 1, 2));
+        Assert.Equal(0f, state.Get(0, N, 2, 2));
+        Assert.Equal(-1, state.IndexOf(N, 2, 2)); // 막힌 칸은 저장하지 않는다
+        Assert.Equal(0f, state.Get(0, N, 1, 2));
     }
 
     [Fact]
@@ -226,17 +233,23 @@ public class ScentSystemTests
     {
         var settings = ScentSettings.Default;
         var world = TestWorlds.Create(20, 20);
-        world.Surface.TrySetState(3, 3, new TileState(Terrain.Dirt, SolidBlock.None, 2, 0));
-        world.Surface.TrySetState(10, 10, new TileState(Terrain.Dirt, SolidBlock.None, 7, 3));
+        world.Nest.TrySetState(3, 3, new TileState(Terrain.Dirt, SolidBlock.None, 2, 0));
+        world.Nest.TrySetState(10, 10, new TileState(Terrain.Dirt, SolidBlock.None, 7, 3));
+        world.Surface.TrySetState(1, 1, new TileState(Terrain.Dirt, SolidBlock.None, 2, 0));
+        world.Surface.TrySetState(2, 3, new TileState(Terrain.Dirt, SolidBlock.None, 6, 0)); // 같은 묶음 칸 (0,0): 합 8
         var system = new ScentSystem(world);
         var state = new ScentState(world.Config, 2);
         system.Tick(state, settings); // 0에서 시작: 확산·감쇠 후 0, 발생만 남는다
 
-        Near.Equal(1.0f * 0.1f * 2, state.Get(0, S, 3, 3), 6);
-        Near.Equal(1.0f * 0.1f * 7, state.Get(0, S, 10, 10), 6);
-        Near.Equal(1.0f * 0.1f * 3, state.Get(1, S, 10, 10), 6);
-        Assert.Equal(0f, state.Get(1, S, 3, 3));
-        Assert.Equal(0f, state.Get(0, N, 10, 10));
+        // 개미집(원래 해상도): 칸마다 e·dt·수량
+        Near.Equal(1.0f * 0.1f * 2, state.Get(0, N, 3, 3), 6);
+        Near.Equal(1.0f * 0.1f * 7, state.Get(0, N, 10, 10), 6);
+        Near.Equal(1.0f * 0.1f * 3, state.Get(1, N, 10, 10), 6);
+        Assert.Equal(0f, state.Get(1, N, 3, 3));
+        // 지상(묶음 격자): e·dt·(묶음 칸 안 수량 합) / F²
+        Near.Equal(1.0f * 0.1f * 8 / (F * F), state.Get(0, S, 0, 0), 6);
+        Assert.Equal(state.Get(0, S, 0, 0), state.Get(0, S, 3, 3)); // 같은 묶음 칸
+        Assert.Equal(0f, state.Get(0, S, 10, 10));
     }
 
     [Fact]
@@ -245,15 +258,15 @@ public class ScentSystemTests
         // 발생원 칸(수량 1)에 초기 농도 10. 기대값 = (10·(1 − 4a))·exp(−k·dt) + e·dt·1
         var settings = Single(d: 0.6, dp: 0, k: 0.5, e: 2.0, source: QuantityKind.Food);
         var (world, system, state) = Setup(5, 5, settings);
-        world.Surface.TrySetState(2, 2, new TileState(Terrain.Dirt, SolidBlock.None, 1, 0));
-        Put(state, S, 2, 2, 10);
+        world.Nest.TrySetState(2, 2, new TileState(Terrain.Dirt, SolidBlock.None, 1, 0));
+        Put(state, N, 2, 2, 10);
         system.Tick(state, settings);
 
         float a = (float)(0.6 * 0.1), decay = (float)Math.Exp(-0.5 * 0.1), emit = (float)(2.0 * 0.1);
         float expectedCenter = (10 + a * (-4 * 10f)) * decay + emit * 1;
         float expectedNeighbor = (0 + a * 10f) * decay;
-        Assert.Equal(expectedCenter, state.Get(0, S, 2, 2));
-        Assert.Equal(expectedNeighbor, state.Get(0, S, 1, 2));
+        Assert.Equal(expectedCenter, state.Get(0, N, 2, 2));
+        Assert.Equal(expectedNeighbor, state.Get(0, N, 1, 2));
     }
 
     [Fact]
@@ -290,14 +303,14 @@ public class ScentSystemTests
         var settings = Single(d: 0, dp: 0.6); // 레이어 내 확산을 꺼서 통로 교환만 관찰
         var (world, system, state) = Setup(10, 10, settings);
         new MapEditor(world).Apply(EditOp.AddPassage(5, 5));
-        Put(state, S, 5, 5, 100);
-        Put(state, S, 4, 5, 100); // 굴착된 3×3 안이지만 중심이 아님
+        Put(state, S, 5, 5, 100); // 지상 묶음 칸 (1,1) = x 4~7, y 4~7 전체
         system.Tick(state, settings);
 
-        Near.Equal(100 - 6f, state.Get(0, S, 5, 5), 4);
+        // 통로 중심 칸에서만 교환: 개미집 (5,5)에 Dp·dt·100 = 6, 지상 묶음 칸은 6 / F² 줄어 총량(칸 단위) 보존.
         Near.Equal(6f, state.Get(0, N, 5, 5), 4);
-        Assert.Equal(0f, state.Get(0, N, 4, 5));
-        Assert.Equal(100f, state.Get(0, S, 4, 5));
+        Assert.Equal(0f, state.Get(0, N, 4, 5)); // 굴착된 3×3 안이지만 중심이 아님
+        Near.Equal(100 - 6f / (F * F), state.Get(0, S, 5, 5), 4);
+        Assert.Equal(100 * F * F, state.Total(0), 2);
     }
 
     [Fact]
@@ -308,8 +321,9 @@ public class ScentSystemTests
         new MapEditor(world).Apply(EditOp.AddPassage(6, 6));
         var system = new ScentSystem(world);
         var state = new ScentState(world.Config, 1);
-        Put(state, S, 6, 6, 90);
-        for (int i = 0; i < 2000; i++) system.Tick(state, settings);
+        Put(state, S, 6, 6, 90f / (F * F)); // 묶음 칸(16칸)의 평균 농도 → 총량 90
+        Assert.Equal(90, state.Total(0), 3);
+        for (int i = 0; i < 30_000; i++) system.Tick(state, settings); // 지상 묶음 칸 사이 교환율은 D·dt/F²라 평형까지 오래 걸린다
         Assert.Equal(90, state.Total(0), 2);
         // 개미집은 3×3(9칸)만 열려 있으므로 평형에서 지상 144칸 + 개미집 9칸에 고르게 퍼진다.
         Assert.Equal(90.0 / 153, state.Get(0, N, 5, 5), 2);
@@ -356,10 +370,10 @@ public class ScentSystemTests
         world.Surface.TrySetState(1, 1, new TileState(Terrain.Dirt, SolidBlock.None, 5, 0));
         var system = new ScentSystem(world);
         var state = new ScentState(world.Config, 3);
-        state.MutableField(2, S)[world.Config.ToLinearIndex(5, 5)] = 10;
+        Assert.True(state.Set(2, S, 5, 5, 10)); // 묶음 칸 (1,1)
         system.Tick(state, settings);
         Assert.True(state.Get(0, S, 1, 1) > 0);
         Assert.True(state.Get(2, S, 5, 5) > 0 && state.Get(2, S, 5, 5) < 10);
-        Assert.Equal(0f, state.Get(2, S, 1, 1));
+        Assert.Equal(0f, state.Get(2, S, 1, 1)); // 묶음 칸 (0,0)은 (1,1)과 대각 → 교환 없음
     }
 }

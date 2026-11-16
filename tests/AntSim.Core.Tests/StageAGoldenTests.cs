@@ -134,7 +134,11 @@ public class StageAGoldenTests
         ["count37.final"] = 0xFD4356915A288092UL,
         ["count37.rng"] = 0x0293568D323C5333UL,
         ["count37.trace"] = 0xC8A70214DEAF49EAUL,
-        ["fixture.continued"] = 0xA58F190D4AAF1C4DUL,
+        // 냄새가 섞인 해시 4개(fixture.continued, session.300, session.300.scent, session.reset50.200)는 냄새 저장 방식 변경
+        // (docs/PERF_SCENT_DESIGN.md, 사용자 결정 P-6)으로 다시 고정했다. 이전 값(main 80f28aa): A58F190D4AAF1C4D, A58F190D4AAF1C4D,
+        // 0081BBDB9C6C5B72, 37B494859AD11872. 개미 부분(*.ants, main c968c01에서 생성)은 변경 전후 같다.
+        ["fixture.continued"] = 0x74441765E2AE9DEEUL,
+        ["fixture.continued.ants"] = 0x4FBFC3D2DA6576D7UL,
         ["fixture.file"] = 0xB8ABDDAA2137D12EUL,
         ["fixture.loaded"] = 0xBA459D2E41A20748UL,
         ["open.final"] = 0x131EE81B201F5468UL,
@@ -146,9 +150,11 @@ public class StageAGoldenTests
         ["passages.trace"] = 0x35E5C339E697F9F9UL,
         ["passages.transitions"] = 0x000000000000019BUL,
         ["save.150.state"] = 0xBA459D2E41A20748UL,
-        ["session.300"] = 0xA58F190D4AAF1C4DUL,
-        ["session.300.scent"] = 0x0081BBDB9C6C5B72UL,
-        ["session.reset50.200"] = 0x37B494859AD11872UL,
+        ["session.300"] = 0xC30AAD5BA84CC4B3UL,
+        ["session.300.ants"] = 0x4FBFC3D2DA6576D7UL,
+        ["session.300.scent"] = 0x094A6A990E27950EUL,
+        ["session.reset50.200"] = 0xF5C02A6B7711AE4EUL,
+        ["session.reset50.200.ants"] = 0x84C42CF28A1409E6UL,
         ["session.spawn"] = 0x8A9C1B2DAD5EFD82UL,
         ["walls.final"] = 0xBE2AA3011277DCBEUL,
         ["walls.rng"] = 0x5FC97C6ADD8B32D3UL,
@@ -263,6 +269,9 @@ public class StageAGoldenTests
     private static ulong SessionHash(SimulationSession s) =>
         Combine(StageAHash(s.Ants), RngHash(s.Ants), s.Scent.ComputeHash(), s.World.ComputeContentHash(), (ulong)s.Tick);
 
+    /// <summary>세션 해시 중 개미(Stage A 이동 필드 + 이동 난수) 부분. 냄새 저장 방식이 바뀌어도 그대로여야 한다.</summary>
+    private static ulong SessionAntsHash(SimulationSession s) => Combine(StageAHash(s.Ants), RngHash(s.Ants), (ulong)s.Tick);
+
     [Fact]
     public void Scenario5_SpawnAndReset()
     {
@@ -271,6 +280,7 @@ public class StageAGoldenTests
         session.Step(300);
         ulong first = SessionHash(session);
         Check("session.300", first);
+        Check("session.300.ants", SessionAntsHash(session));
         Check("session.300.scent", session.Scent.ComputeHash());
 
         session.Reset();
@@ -281,6 +291,7 @@ public class StageAGoldenTests
         session.Reset(NestAnts with { InitialCount = 50, Seed = 9 });
         session.Step(200);
         Check("session.reset50.200", SessionHash(session));
+        Check("session.reset50.200.ants", SessionAntsHash(session));
     }
 
     [Fact]
@@ -316,11 +327,14 @@ public class StageAGoldenTests
         Check("fixture.loaded", StageAHash(loaded.Ants));
         loaded.Step(150);
         Check("fixture.continued", SessionHash(loaded));
+        Check("fixture.continued.ants", SessionAntsHash(loaded));
         if (GoldenPlatform)
         {
             var straight = NewSession();
             straight.Step(300);
-            Assert.Equal(SessionHash(straight), SessionHash(loaded)); // 고정 파일 = 이 시나리오의 150틱 상태
+            // 고정 파일 = 이 시나리오의 150틱 상태. v2의 원래 해상도 냄새는 불러올 때 새 격자로 변환되므로 냄새는 끊김 없는 실행과 다를 수 있고,
+            // 개미 이동은 냄새를 읽지 않으므로 같아야 한다.
+            Assert.Equal(SessionAntsHash(straight), SessionAntsHash(loaded));
         }
     }
 

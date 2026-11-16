@@ -130,7 +130,7 @@ public partial class Main
         await WaitUntil(() => _snapshot is { } s && s.Tick == paused, "히트맵 스냅샷 수신");
         await NextFrame();
         check(_heatmap.Visible, "히트맵 표시(음식, 지상)");
-        check(_snapshot!.Data[_simWorld!.Config.ToLinearIndex(40, 40)] > 0, "먹이 칸에 음식 냄새");
+        check(_snapshot!.Data[_snapshot.FieldIndex(40, 40)] > 0, "먹이 칸에 음식 냄새");
         check(_world.ComputeContentHash() == editorWorld, "시뮬레이션이 원본 맵을 바꾸지 않음");
 
         if (ScreenshotPath is { } screenshot && HasDisplay) await CaptureSimulationScreenshot(screenshot);
@@ -978,7 +978,7 @@ public partial class Main
         for (int i = 0; i < f.Count; i++)
         {
             if (f.Layer[i] != (byte)LayerId.Surface) continue;
-            float v = snap.Field(0)[_simWorld!.Config.ToLinearIndex((int)f.X[i], (int)f.Y[i])];
+            float v = snap.Field(0)[snap.FieldIndex((int)f.X[i], (int)f.Y[i])];
             if (v > bestScent) { bestScent = v; best = i; }
         }
         if (best < 0) return;
