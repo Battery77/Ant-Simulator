@@ -6,7 +6,7 @@ using AntSim.Core.Simulation;
 using AntSim.Core.Worlds;
 
 /// <summary>
-/// 단계 B1 감각 패스 측정(docs/STAGE_B_DESIGN.md F.3). 결과는 docs/BENCHMARKS.md에 기록한다.
+/// 단계 B1 감각 패스 측정(docs/STAGE_B_DESIGN.md F.3, 게임형 단순화: 센서 칸 값 샘플링). 결과는 docs/BENCHMARKS.md에 기록한다.
 /// <list type="bullet">
 /// <item>지도: 1024² 개미집 프리셋 + 통로 굴착 2,000회 + 먹이 5,000칸(단계 A 측정과 같음). 개미는 지상에 놓는다.</item>
 /// <item>분포: 밀집 = 지상 중앙 64×64 안 균등, 흩어짐 = 지상 1024² 전체 균등(고정 시드).</item>
@@ -60,7 +60,7 @@ internal static class SensingBenchmark
         foreach (string dist in new[] { "밀집", "흩어짐" })
         foreach (int n in Counts)
         {
-            // Stage A만 / Stage A + 감각(기본 K = 2, 거리 1, 이중선형). 이동은 상태를 바꾸므로 각자 복사본을 쓴다.
+            // Stage A만 / Stage A + 감각(기본 K = 2, 거리 1). 이동은 상태를 바꾸므로 각자 복사본을 쓴다.
             var moveOnly = Place(world, n, 2, dist == "밀집" ? 64 : 1024);
             var moveAndSense = Place(world, n, 2, dist == "밀집" ? 64 : 1024);
             var moveWorld = world.Clone();
@@ -69,14 +69,13 @@ internal static class SensingBenchmark
             var sense2 = AntSensingConfig.Create(settings, scent8);
             long tick = 0;
             cases.Add(new Case($"{dist,-3} {n,7} | Stage A만 1틱", () => Time(() => system.Tick(moveOnly, moveWorld, settings, Dt))));
-            cases.Add(new Case($"{dist,-3} {n,7} | Stage A + 감각 1틱 (K2 d1 이중선형)", () => Time(() =>
+            cases.Add(new Case($"{dist,-3} {n,7} | Stage A + 감각 1틱 (K2 d1)", () => Time(() =>
             {
                 AntSensing.Sense(moveAndSense, state, masks, sense2, Dt, ++tick);
                 system.Tick(moveAndSense, moveWorld, settings, Dt);
             })));
             foreach (int k in new[] { 2, 8 })
             foreach (float d in new[] { 1f, 2f })
-            foreach (var sampling in new[] { SenseSampling.Bilinear, SenseSampling.Nearest })
             {
                 var ants = populations[(dist, n, k)];
                 var sensing = AntSensingConfig.Create(AntSettings.Default with
@@ -84,12 +83,12 @@ internal static class SensingBenchmark
                     SensorDistance = d, SensedScentKeys = scent8.Types.Take(k).Select(t => t.Key).ToArray(),
                 }, scent8);
                 long senseTick = 0;
-                string name = $"{dist,-3} {n,7} | 감각 패스 K{k} d{d:0} {(sampling == SenseSampling.Bilinear ? "이중선형" : "최근접")}";
-                cases.Add(new Case(name, () => Time(() => AntSensing.Sense(ants, state, masks, sensing, Dt, ++senseTick, sampling))));
-                if (n == 100_000 && d == 1 && sampling == SenseSampling.Bilinear)
+                string name = $"{dist,-3} {n,7} | 감각 패스 K{k} d{d:0}";
+                cases.Add(new Case(name, () => Time(() => AntSensing.Sense(ants, state, masks, sensing, Dt, ++senseTick))));
+                if (n == 100_000 && d == 1)
                 {
                     long before = GC.GetAllocatedBytesForCurrentThread();
-                    for (int t = 0; t < 100; t++) AntSensing.Sense(ants, state, masks, sensing, Dt, ++senseTick, sampling);
+                    for (int t = 0; t < 100; t++) AntSensing.Sense(ants, state, masks, sensing, Dt, ++senseTick);
                     allocations.Add($"{dist} 100,000 K{k}: 감각 패스 100회 할당 {GC.GetAllocatedBytesForCurrentThread() - before}바이트");
                 }
             }

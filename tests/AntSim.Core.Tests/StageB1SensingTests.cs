@@ -313,7 +313,7 @@ public class StageB1SensingTests(ITestOutputHelper output)
         Assert.Empty((AntSettings.Default with { PathErrorSigma = 0f }).Validate());
     }
 
-    // ---------- 10. 보간 ----------
+    // ---------- 10. 샘플링(센서 칸 값, 보간 없음) ----------
 
     [Fact]
     public void UniformField_GivesTheSameValue_EvenNextToWalls()
@@ -330,20 +330,24 @@ public class StageB1SensingTests(ITestOutputHelper output)
     }
 
     [Fact]
-    public void LinearField_IsInterpolatedExactly()
+    public void Gradient_ReadsTheSensorTileValue_WithoutInterpolation()
     {
-        // c(칸 x) = x + 0.5 = 칸 중심의 x좌표. 칸 중심 기준 이중선형이면 센서점의 값은 센서 x좌표와 같다.
+        // c(칸 x, y) = 100·x + y. 센서점이 있는 칸의 값을 그대로 읽는다: 칸 = (⌊센서 x⌋, ⌊센서 y⌋).
         var rig = Rig.Create(32, 32, AntSettings.Default with { SensorDistance = 1.5f, SensorAngleDegrees = 30f });
-        rig.Fill(0, (x, _) => x + 0.5f);
+        rig.Fill(0, (x, y) => 100 * x + y);
         int i = rig.SenseOne(10.3f, 10.6f, 0.3f);
         double[] directions = { 0.3 - Math.PI / 6, 0.3, 0.3 + Math.PI / 6 };
-        for (int d = 0; d < 3; d++) Assert.Equal(10.3 + 1.5 * Math.Cos(directions[d]), rig.Value(i, 0, d), 4);
+        for (int d = 0; d < 3; d++)
+        {
+            int tx = (int)Math.Floor(10.3 + 1.5 * Math.Cos(directions[d])), ty = (int)Math.Floor(10.6 + 1.5 * Math.Sin(directions[d]));
+            Assert.Equal(100 * tx + ty, rig.Value(i, 0, d));
+        }
     }
 
-    // ---------- 11·12·13. 벽 차폐, 벽 너머 샘플, 대각 모서리 (설계 D.2 예 1~3) ----------
+    // ---------- 11·12·13. 벽 차폐, 벽 옆 칸, 대각 모서리 (설계 D.2 예 1~3) ----------
 
     [Fact]
-    public void Example1_WallBetweenAntAndSensor_Blocks_AtDistanceOneAndTwo()
+    public void Example1_SensorOnAWall_IsBlocked_ButDistanceTwoSeesPastAThinWall()
     {
         var rig = Rig.Create();
         for (int y = 0; y < 16; y++) rig.Solid(6, y);
@@ -355,27 +359,28 @@ public class StageB1SensingTests(ITestOutputHelper output)
         Assert.Equal(0f, rig.Value(i, 0, Front));
         Assert.Equal(0f, rig.Value(i, 1, Front)); // 차폐는 모든 종류에 공통
 
-        rig.Settings = AntSettings.Default with { SensorDistance = 2f }; // 센서 (7.5, 5.5)는 열린 칸이지만 경로가 벽을 지난다
+        // 게임형 단순화: 센서 칸만 본다. 거리 2의 센서 (7.5, 5.5)는 열린 칸이라, 사이의 1칸 벽을 넘어 읽는다(설계 D.2에 명시한 한계).
+        rig.Settings = AntSettings.Default with { SensorDistance = 2f };
         i = rig.SenseOne(5.5f, 5.5f, 0);
-        Assert.True(rig.Info(i).IsBlocked(Front));
-        Assert.Equal(0f, rig.Value(i, 0, Front));
+        Assert.False(rig.Info(i).IsBlocked(Front));
+        Assert.Equal(0.9f, rig.Value(i, 0, Front));
     }
 
     [Fact]
-    public void Example2_SamplesBehindTheWall_AreNotMixed()
+    public void Example2_SensorNextToAWall_ReadsOnlyItsOwnTile()
     {
         var rig = Rig.Create();
         for (int y = 0; y < 16; y++) rig.Solid(6, y);
         rig.Set(0, 5, 5, 0.4f);
         rig.Set(0, 5, 6, 0.2f);
         rig.Set(0, 7, 5, 0.9f);
-        int i = rig.SenseOne(4.9f, 5.5f, 0); // 센서 (5.9, 5.5): u = 5.4, v = 5.0
+        int i = rig.SenseOne(4.9f, 5.5f, 0); // 센서 (5.9, 5.5): 칸 (5,5)
         Assert.False(rig.Info(i).IsBlocked(Front));
-        Assert.Equal(0.4f, rig.Value(i, 0, Front), 1e-6f); // 막힌 칸을 0으로 넣었다면 0.24
+        Assert.Equal(0.4f, rig.Value(i, 0, Front)); // 이웃 칸(벽·벽 너머)과 섞지 않는다
     }
 
     [Fact]
-    public void Example3_DiagonalBehindABlockedCorner_IsExcluded()
+    public void Example3_DiagonalBehindABlockedCorner_IsNotRead()
     {
         var rig = Rig.Create();
         rig.Solid(6, 5);
@@ -384,7 +389,7 @@ public class StageB1SensingTests(ITestOutputHelper output)
         rig.Set(0, 6, 6, 0.9f);
         int i = rig.SenseOne(5.2f, 5.2f, MathF.PI / 4); // 정면 센서 ≈ (5.907, 5.907), 칸 (5,5)
         Assert.False(rig.Info(i).IsBlocked(Front));
-        Assert.Equal(0.4f, rig.Value(i, 0, Front), 1e-6f); // 열린 칸만 재정규화했다면 ≈ 0.56
+        Assert.Equal(0.4f, rig.Value(i, 0, Front)); // 대각 칸 (6,6)의 0.9는 읽지 않는다
         Assert.True(rig.Info(i).IsBlocked(Left));  // h − 45° = 0 → (6.2, 5.2) 고체
         Assert.True(rig.Info(i).IsBlocked(Right)); // h + 45° = 90° → (5.2, 6.2) 고체
         Assert.Equal(0b101, rig.Info(i).Flags);
@@ -419,13 +424,13 @@ public class StageB1SensingTests(ITestOutputHelper output)
         rig.Wet(12, 10);
         rig.Wet(11, 10);
         rig.Fill(0, (_, _) => 0.3f);
-        int i = rig.SenseOne(10.5f, 10.5f, 0); // 경로 (11,10) 물, 센서 (12.5, 10.5) 물
+        int i = rig.SenseOne(10.5f, 10.5f, 0); // 센서 (12.5, 10.5) 물
         Assert.False(rig.Info(i).IsBlocked(Front));
-        Assert.Equal(0.3f, rig.Value(i, 0, Front), 1e-6f);
+        Assert.Equal(0.3f, rig.Value(i, 0, Front));
     }
 
     [Fact]
-    public void MapBoundary_BlocksOutside_AndPartialSamplesStayInBounds()
+    public void MapBoundary_BlocksOutside_AndEdgeTilesAreRead()
     {
         var rig = Rig.Create();
         rig.Fill(0, (_, _) => 0.6f);
@@ -433,9 +438,9 @@ public class StageB1SensingTests(ITestOutputHelper output)
         Assert.True(rig.Info(i).IsBlocked(Front));
         Assert.Equal(0f, rig.Value(i, 0, Front));
 
-        i = rig.SenseOne(1.2f, 0.4f, MathF.PI); // 센서 (0.2, 0.4): 2×2 중 3칸이 맵 밖
+        i = rig.SenseOne(1.2f, 0.4f, MathF.PI); // 센서 (0.2, 0.4): 모서리 칸 (0,0)
         Assert.False(rig.Info(i).IsBlocked(Front));
-        Assert.Equal(0.6f, rig.Value(i, 0, Front), 1e-6f);
+        Assert.Equal(0.6f, rig.Value(i, 0, Front));
 
         i = rig.SenseOne(15.5f, 15.5f, MathF.PI / 4); // 오른쪽 아래 모서리 밖
         Assert.True(rig.Info(i).IsBlocked(Front));
@@ -660,25 +665,5 @@ public class StageB1SensingTests(ITestOutputHelper output)
         }
         Assert.Equal(0, senseOnly);
         Assert.True(allocated <= 200 * 32, $"감각 추가 후 틱당 할당이 기존(32바이트)보다 많음: {allocated}바이트/200틱");
-    }
-
-    // ---------- 최근접(내부 비교 경로) ----------
-
-    [Fact]
-    public void NearestSampling_ReadsTheSensorTile_WithTheSameOcclusion()
-    {
-        var rig = Rig.Create();
-        rig.Fill(0, (x, _) => x);
-        rig.Solid(12, 8);
-        var config = AntSensingConfig.Create(rig.Settings, rig.Scent);
-        var ants = new AntPopulation();
-        ants.ConfigureSensing(2);
-        Assert.True(AntSpawner.TrySpawn(ants, rig.World, rig.Settings, LayerId.Surface, 9.9f, 8.5f, out int i, heading: 0));
-        ants.SenseTimerArray[i] = 0.01f;
-        AntSensing.Sense(ants, rig.State, new ScentSystem(rig.World).OpenMasks(), config, 0.1f, 1, SenseSampling.Nearest);
-        var values = new float[6];
-        var info = ants.GetSense(i, values);
-        Assert.Equal(10f, values[Front]); // 센서 (10.9, 8.5) → 칸 10
-        Assert.False(info.IsBlocked(Front));
     }
 }
