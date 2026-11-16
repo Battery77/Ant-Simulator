@@ -9,8 +9,10 @@ namespace AntSim.Core.Serialization;
 /// <summary>
 /// 시뮬레이션 실험 상태 파일(.antexp). 맵 파일(.antmap)과 분리되어 있으며, 실험을 그대로 이어서 실행할 수 있도록
 /// 설정·틱·시작 월드·현재 월드·냄새 필드 전체를 담는다. 모든 정수·실수는 리틀 엔디언.
-/// v2는 v1 끝(냄새 다음, 체크섬 앞)에 개미 설정과 개체 상태를 추가했다. v1 파일은 월드·냄새·틱·경과 시간을 그대로 두고
-/// 개미 0마리(<see cref="AntSettings.None"/>)로 불러온다. 저장은 항상 v2다.
+/// v2는 v1 끝(냄새 다음, 체크섬 앞)에 개미 설정과 개체 상태를 추가했다. v3는 v2 끝(개미 다음, 체크섬 앞)에 단계 B 설정과
+/// 개미별 단계 B 상태(감각, 경로 적분)를 추가했다(B1이 B2 필드까지 전체 레이아웃을 정의하며, 이후 레이아웃·의미를 바꾸면 새 버전).
+/// v1 파일은 월드·냄새·틱·경과 시간을 그대로 두고 개미 0마리(<see cref="AntSettings.None"/>)로, v1/v2 파일의 단계 B 상태는
+/// 생성 때와 같은 결정적 초기값으로 불러온다. 저장은 항상 v3다.
 /// <code>
 /// [v1]
 /// magic        8 bytes  "ANTEXP\0\0"
@@ -33,12 +35,19 @@ namespace AntSim.Core.Serialization;
 /// ants         i32 count, i32 nextId, 이후 배열들(각 count개, 순서 고정):
 ///              id i32, caste u8, layer u8, mobility u8, x, y, prevX, prevY, heading, targetHeading,
 ///              baseSpeed, speedFactor, size, turnTimer, turnIntervalScale (f32), lastTile i32, rng u64
+///
+/// [v3] = v2 + (ants 다음, checksum 앞에)
+/// stageB       f32 sensePeriod, f32 sensorDistance, f32 sensorAngle, f32 pathErrorSigma,
+///              u8 keyMode (0 = 기본 규칙, 1 = 명시 목록), i32 K (0~8), K × string key (해석된 감지 키, 감지 값 배열 순서)
+/// stageBAnts   배열들(각 count개, count = ants의 count): senseTimer f32, senseTick i64, senseHeading f32, senseFlags u8,
+///              senseValues f32 × (count·K·3, [i·K·3 + k·3 + d]), homeX f32, homeY f32, homeFlags u8, navRng u64,
+///              debugExitX f32, debugExitY f32   (개미당 42 + 12K바이트)
 /// </code>
 /// </summary>
 public static class ExperimentSerializer
 {
-    /// <summary>저장 형식 버전. 저장은 항상 이 버전(v2)으로 하고, 불러오기는 v1(개미 구간 없음)과 v2를 모두 지원한다.</summary>
-    public const ushort CurrentVersion = 2;
+    /// <summary>저장 형식 버전. 저장은 항상 이 버전(v3)으로 하고, 불러오기는 v1(개미 구간 없음)·v2(단계 B 구간 없음)·v3를 지원한다.</summary>
+    public const ushort CurrentVersion = 3;
 
     /// <summary>냄새 종류 수 상한(<see cref="ScentSettings.MaxTypes"/>와 같다: 저장할 수 있으면 불러올 수 있다).</summary>
     public const int MaxScentTypes = ScentSettings.MaxTypes;
@@ -48,6 +57,15 @@ public static class ExperimentSerializer
 
     /// <summary>v2 개미 설정의 고정 부분: initialCount 4 + seed 8 + f32 × 12 + tierCount 4 = 64바이트(구간은 각 8바이트).</summary>
     private const int AntSettingsFixedBytes = 4 + 8 + 12 * sizeof(float) + 4;
+
+    /// <summary>v3 단계 B 설정의 고정 부분: f32 × 4 + keyMode 1 + K 4 = 21바이트(키 문자열은 각 4바이트 길이 + 본문).</summary>
+    private const int StageBSettingsFixedBytes = 4 * sizeof(float) + 1 + 4;
+
+    /// <summary>v3 개미 한 마리의 단계 B 고정 부분(감지 값 제외): 4 + 8 + 4 + 1 + 4 + 4 + 1 + 8 + 4 + 4 = 42바이트. 감지 값은 12K바이트.</summary>
+    internal const int StageBBytesPerAnt = 42;
+
+    /// <summary>귀환 벡터 성분 절댓값 상한(타일, docs/STAGE_B_DESIGN.md D.4). B2가 넘으면 기억을 무효화한다.</summary>
+    public const float HomeBound = 1e7f;
     private static ReadOnlySpan<byte> Magic => "ANTEXP\0\0"u8;
 
     public static void Save(SimulationSession session, Stream stream)
@@ -88,6 +106,7 @@ public static class ExperimentSerializer
 
         WriteAntSettings(writer, session.AntSettings);
         WriteAnts(writer, session.Ants);
+        WriteStageB(writer, session);
         writer.WriteChecksum();
     }
 
@@ -136,6 +155,10 @@ public static class ExperimentSerializer
             throw new InvalidOperationException(AntSettings.TickNotSupportedMessage(session.Settings.TickSeconds));
         if (ValidateAnts(session.Ants.Count, session.Ants.NextId, session.Ants, session.World) is { } antError)
             throw new InvalidOperationException($"저장할 수 없는 개미 상태입니다: {antError}");
+        if (session.Ants.SensedTypeCount != session.Sensing.TypeCount)
+            throw new InvalidOperationException("저장할 수 없는 개미 상태입니다: 감지 종류 수가 감지 설정과 다릅니다.");
+        if (ValidateStageB(session.Ants, session.Tick, session.AntSettings.SensePeriodSeconds, session.World) is { } stageBError)
+            throw new InvalidOperationException($"저장할 수 없는 개미 감각 상태입니다: {stageBError}");
     }
 
     public static SimulationSession Load(string path)
@@ -218,6 +241,19 @@ public static class ExperimentSerializer
             antSettings = ReadAntSettings(reader);
             ReadAnts(reader, ants, current);
         }
+        if (version >= 3)
+        {
+            antSettings = ReadStageBSettings(reader, antSettings, settings, out int sensedTypes);
+            ReadStageBAnts(reader, ants, sensedTypes, tick, antSettings.SensePeriodSeconds, current);
+        }
+        else
+        {
+            // v1/v2: 단계 B 상태가 없다. 기본 감지 설정·기본 키 규칙으로 생성 때와 같은 결정적 초기값을 만든다.
+            if (!antSettings.TryResolveSensedScentKeys(settings, out var keys, out _, out string? keyError))
+                throw new MapFormatException($"감지 키를 해석할 수 없습니다: {keyError}");
+            ants.ConfigureSensingForLoad(keys.Length);
+            ants.InitializeStageB(antSettings);
+        }
 
         reader.VerifyChecksum();
         if ((ants.Count > 0 || antSettings.InitialCount > 0) && !AntSettings.SupportsTick(tickSeconds))
@@ -268,6 +304,133 @@ public static class ExperimentSerializer
         var errors = settings.Validate();
         if (errors.Count > 0) throw new MapFormatException($"개미 설정이 잘못되었습니다: {string.Join(" ", errors)}");
         return settings;
+    }
+
+    private static void WriteStageB(ChecksumWriter writer, SimulationSession session)
+    {
+        var s = session.AntSettings;
+        writer.WriteSingle(s.SensePeriodSeconds);
+        writer.WriteSingle(s.SensorDistance);
+        writer.WriteSingle(s.SensorAngleDegrees);
+        writer.WriteSingle(s.PathErrorSigma);
+        writer.WriteByte(s.SensedScentKeys is null ? (byte)0 : (byte)1);
+        var keys = session.Sensing.Keys;
+        writer.WriteInt32(keys.Count);
+        foreach (string key in keys) writer.WriteString(key);
+
+        var a = session.Ants;
+        int n = a.Count, values = n * a.SensedTypeCount * AntPopulation.SensorCount;
+        writer.Write(MemoryMarshal.AsBytes(a.SenseTimerArray.AsSpan(0, n)));
+        writer.Write(MemoryMarshal.AsBytes(a.SenseTickArray.AsSpan(0, n)));
+        writer.Write(MemoryMarshal.AsBytes(a.SenseHeadingArray.AsSpan(0, n)));
+        writer.Write(a.SenseFlagsArray.AsSpan(0, n));
+        writer.Write(MemoryMarshal.AsBytes(a.SenseValuesArray.AsSpan(0, values)));
+        writer.Write(MemoryMarshal.AsBytes(a.HomeXArray.AsSpan(0, n)));
+        writer.Write(MemoryMarshal.AsBytes(a.HomeYArray.AsSpan(0, n)));
+        writer.Write(a.HomeFlagsArray.AsSpan(0, n));
+        writer.Write(MemoryMarshal.AsBytes(a.NavRngArray.AsSpan(0, n)));
+        writer.Write(MemoryMarshal.AsBytes(a.DebugExitXArray.AsSpan(0, n)));
+        writer.Write(MemoryMarshal.AsBytes(a.DebugExitYArray.AsSpan(0, n)));
+    }
+
+    /// <summary>
+    /// v3 단계 B 설정을 읽어 개미 설정에 합친다. 키 수는 문자열을 읽기 전에 확인하고, 키는 같은 파일의 냄새 설정에 있어야 한다.
+    /// 기본 규칙(keyMode 0)이면 저장된 키가 기본 규칙의 해석 결과와 같아야 한다.
+    /// </summary>
+    private static AntSettings ReadStageBSettings(ChecksumReader reader, AntSettings antSettings, ScentSettings scent, out int sensedTypes)
+    {
+        StreamLimits.Require(reader.BaseStream, StageBSettingsFixedBytes, "개미 감각 설정");
+        float period = reader.ReadSingle(), distance = reader.ReadSingle(), angle = reader.ReadSingle(), sigma = reader.ReadSingle();
+        byte keyMode = reader.ReadByte();
+        int count = reader.ReadInt32();
+        if (keyMode > 1) throw new MapFormatException($"감지 키 방식이 잘못되었습니다: {keyMode}.");
+        if (count < 0 || count > AntSettings.MaxSensedTypes)
+            throw new MapFormatException($"감지 냄새 종류 수가 잘못되었습니다: {count} (최대 {AntSettings.MaxSensedTypes}).");
+        StreamLimits.Require(reader.BaseStream, 4L * count, "감지 키");
+        var keys = new string[count];
+        for (int i = 0; i < count; i++) keys[i] = reader.ReadString();
+
+        var merged = antSettings with
+        {
+            SensePeriodSeconds = period, SensorDistance = distance, SensorAngleDegrees = angle, PathErrorSigma = sigma,
+            SensedScentKeys = keyMode == 1 ? keys : null,
+        };
+        // 기본 규칙이어도 저장된 키 목록 자체(빈 키·중복·개수)를 검사한다.
+        var errors = (merged with { SensedScentKeys = keys }).Validate();
+        if (errors.Count > 0) throw new MapFormatException($"개미 감각 설정이 잘못되었습니다: {string.Join(" ", errors)}");
+        if (!merged.TryResolveSensedScentKeys(scent, out var resolved, out _, out string? keyError))
+            throw new MapFormatException($"감지 키가 잘못되었습니다: {keyError}");
+        if (!resolved.SequenceEqual(keys, StringComparer.Ordinal))
+            throw new MapFormatException("저장된 감지 키가 기본 규칙의 해석 결과와 다릅니다.");
+        sensedTypes = count;
+        return merged;
+    }
+
+    private static void ReadStageBAnts(ChecksumReader reader, AntPopulation ants, int sensedTypes, long tick, float period, World world)
+    {
+        int n = ants.Count;
+        // 배열을 만들기 전에 단계 B 본문 전체와 체크섬이 실제로 있는지 확인한다(n ≤ 100,000, K ≤ 8이라 long 곱은 넘치지 않는다).
+        long bytes = (long)n * (StageBBytesPerAnt + 12L * sensedTypes) + 8;
+        StreamLimits.Require(reader.BaseStream, bytes, "개미 감각 상태");
+        ants.ConfigureSensingForLoad(sensedTypes);
+        int values = n * sensedTypes * AntPopulation.SensorCount;
+        reader.Read(MemoryMarshal.AsBytes(ants.SenseTimerArray.AsSpan(0, n)));
+        reader.Read(MemoryMarshal.AsBytes(ants.SenseTickArray.AsSpan(0, n)));
+        reader.Read(MemoryMarshal.AsBytes(ants.SenseHeadingArray.AsSpan(0, n)));
+        reader.Read(ants.SenseFlagsArray.AsSpan(0, n));
+        reader.Read(MemoryMarshal.AsBytes(ants.SenseValuesArray.AsSpan(0, values)));
+        reader.Read(MemoryMarshal.AsBytes(ants.HomeXArray.AsSpan(0, n)));
+        reader.Read(MemoryMarshal.AsBytes(ants.HomeYArray.AsSpan(0, n)));
+        reader.Read(ants.HomeFlagsArray.AsSpan(0, n));
+        reader.Read(MemoryMarshal.AsBytes(ants.NavRngArray.AsSpan(0, n)));
+        reader.Read(MemoryMarshal.AsBytes(ants.DebugExitXArray.AsSpan(0, n)));
+        reader.Read(MemoryMarshal.AsBytes(ants.DebugExitYArray.AsSpan(0, n)));
+        if (ValidateStageB(ants, tick, period, world) is { } error) throw new MapFormatException(error);
+    }
+
+    /// <summary>
+    /// 단계 B 개체 상태 검사(저장 전·불러온 뒤 같은 규칙). 문제가 없으면 null, 있으면 첫 문제의 설명.
+    /// </summary>
+    internal static string? ValidateStageB(AntPopulation ants, long tick, float period, World world)
+    {
+        int n = ants.Count, k = ants.SensedTypeCount, stride = k * AntPopulation.SensorCount;
+        int width = world.Config.Width, height = world.Config.Height;
+        var values = ants.SenseValuesArray;
+        for (int i = 0; i < n; i++)
+        {
+            int id = ants.IdArray[i];
+            float timer = ants.SenseTimerArray[i];
+            if (!(timer > 0 && timer <= period)) return $"개미 {id}의 감지 타이머가 잘못되었습니다(0 초과 {period}초 이하): {timer}.";
+            long sensed = ants.SenseTickArray[i];
+            if (sensed != AntPopulation.NotSensed && !(sensed >= 1 && sensed <= tick)) return $"개미 {id}의 마지막 감지 틱이 잘못되었습니다: {sensed}.";
+            float heading = ants.SenseHeadingArray[i];
+            if (!(MathF.Abs(heading) <= MaxAngle)) return $"개미 {id}의 감지 방향이 잘못되었습니다.";
+            byte flags = ants.SenseFlagsArray[i];
+            if ((flags & ~0b111) != 0) return $"개미 {id}의 차폐 비트가 잘못되었습니다: {flags}.";
+            if (sensed == AntPopulation.NotSensed && (flags != 0 || heading != 0)) return $"개미 {id}: 감지 전인데 감지 결과가 있습니다.";
+            for (int j = 0; j < stride; j++)
+            {
+                float v = values[i * stride + j];
+                if (!(v >= 0 && v <= ScentState.MaxConcentration)) return $"개미 {id}의 감지 값이 지원 범위 밖입니다.";
+                int sensor = j % AntPopulation.SensorCount;
+                if (v != 0 && (sensed == AntPopulation.NotSensed || (flags & (1 << sensor)) != 0))
+                    return $"개미 {id}: 감지 전이거나 차폐된 센서에 값이 있습니다.";
+            }
+            byte home = ants.HomeFlagsArray[i];
+            if ((home & ~1) != 0) return $"개미 {id}의 귀환 기억 플래그가 잘못되었습니다: {home}.";
+            float hx = ants.HomeXArray[i], hy = ants.HomeYArray[i], ex = ants.DebugExitXArray[i], ey = ants.DebugExitYArray[i];
+            if (home == 0)
+            {
+                if (hx != 0 || hy != 0 || ex != 0 || ey != 0) return $"개미 {id}: 무효인 귀환 기억에 값이 있습니다.";
+            }
+            else
+            {
+                if (!(MathF.Abs(hx) <= HomeBound && MathF.Abs(hy) <= HomeBound)) return $"개미 {id}의 귀환 벡터가 잘못되었습니다.";
+                if (!(ex >= 0 && ex < width && ey >= 0 && ey < height)) return $"개미 {id}의 기준 출구 좌표가 맵 밖입니다.";
+            }
+            if (ants.NavRngArray[i] == 0) return $"개미 {id}의 경로 적분 난수 상태가 0입니다.";
+        }
+        return null;
     }
 
     private static void WriteAnts(ChecksumWriter writer, AntPopulation ants)

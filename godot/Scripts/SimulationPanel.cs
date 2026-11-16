@@ -104,6 +104,8 @@ public partial class SimulationPanel : PanelContainer
     /// <summary>범례 색 막대(종류 → 그라디언트). 단일 모드는 type = -1로 호출된다.</summary>
     public void SetLegendGradientProvider(Func<int, Gradient> provider) => _legendGradient = provider;
 
+    private ScrollContainer _scroll = null!;
+
     public override void _Ready()
     {
         CustomMinimumSize = new Vector2(280, 0);
@@ -111,7 +113,7 @@ public partial class SimulationPanel : PanelContainer
         var margin = new MarginContainer();
         foreach (var side in new[] { "left", "right", "top", "bottom" }) margin.AddThemeConstantOverride($"margin_{side}", 8);
         AddChild(margin);
-        var scroll = new ScrollContainer { HorizontalScrollMode = ScrollContainer.ScrollMode.Disabled };
+        var scroll = _scroll = new ScrollContainer { HorizontalScrollMode = ScrollContainer.ScrollMode.Disabled };
         margin.AddChild(scroll);
         var root = new VBoxContainer { SizeFlagsHorizontal = SizeFlags.ExpandFill };
         root.AddThemeConstantOverride("separation", 6);
@@ -282,6 +284,12 @@ public partial class SimulationPanel : PanelContainer
 
     public void SetSettingsMessage(string text) => _settingsMessage.Text = text;
     public void SetInfo(string text) => _info.Text = text;
+
+    /// <summary>패널을 맨 아래(정보 칸)까지 스크롤한다(스모크 테스트 캡처용).</summary>
+    public void ScrollToEnd() => _scroll.ScrollVertical = (int)_scroll.GetVScrollBar().MaxValue;
+
+    /// <summary>패널을 맨 위로 되돌린다(스모크 테스트 캡처용).</summary>
+    public void ScrollToStart() => _scroll.ScrollVertical = 0;
     public void SetStatus(string text) => _status.Text = text;
 
     private void OnHeatmapOptionsChanged()

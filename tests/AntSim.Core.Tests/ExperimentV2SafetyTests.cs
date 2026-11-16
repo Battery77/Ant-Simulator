@@ -20,11 +20,45 @@ public class ExperimentV2SafetyTests(ITestOutputHelper output)
     private static SimulationSession NewSession(int ants = 40) =>
         new(SimulationSessionTests.SampleWorld(), ScentSettings.Default, Ants with { InitialCount = ants });
 
-    private static byte[] Save(SimulationSession session)
+    /// <summary>
+    /// v2 레코드를 만든다. 저장은 v3이므로(단계 B1) 현재 저장 결과에서 단계 B 구간(체크섬 바로 앞)을 떼고 버전을 2로 바꿔
+    /// 체크섬을 다시 계산한다. 결과는 main(v2 저장)에서 같은 세션을 저장한 바이트와 같은 레이아웃이다.
+    /// </summary>
+    private static byte[] Save(SimulationSession session) => ToV2(SaveCurrent(session), session);
+
+    internal static byte[] SaveCurrent(SimulationSession session)
     {
         using var stream = new MemoryStream();
         ExperimentSerializer.Save(session, stream);
         return stream.ToArray();
+    }
+
+    /// <summary>v3 저장 바이트 → 같은 상태의 v2 바이트(단계 B 설정·개미별 단계 B 배열 제거).</summary>
+    internal static byte[] ToV2(byte[] v3, SimulationSession session)
+    {
+        Assert.Equal(3, BinaryPrimitives.ReadUInt16LittleEndian(v3.AsSpan(8)));
+        int k = session.Sensing.TypeCount;
+        int block = 4 * 4 + 1 + 4 + session.Sensing.Keys.Sum(key => 4 + System.Text.Encoding.UTF8.GetByteCount(key))
+                    + session.Ants.Count * (ExperimentSerializer.StageBBytesPerAnt + 12 * k);
+        int end = v3.Length - 8;
+        var v2 = v3.AsSpan(0, end - block).ToArray().Concat(new byte[8]).ToArray();
+        BinaryPrimitives.WriteUInt16LittleEndian(v2.AsSpan(8), 2);
+        Rechecksum(v2);
+        return v2;
+    }
+
+    /// <summary>
+    /// Stage A 상태 해시(틱·월드·냄새·개미 Stage A 필드). v2에는 단계 B 상태가 없어 불러오면 초기값이 되므로, v2 왕복 비교는 이 해시로 한다
+    /// (단계 B 감각은 Stage A 결과를 바꾸지 않는다는 계약도 함께 확인된다). 단계 B까지 포함한 v3 왕복은 ExperimentV3Tests가 검사한다.
+    /// </summary>
+    internal static ulong StageAState(SimulationSession s)
+    {
+        var h = Fnv1a64.Create();
+        h.Add((ulong)s.Tick);
+        h.Add(s.World.ComputeContentHash());
+        h.Add(s.Scent.ComputeHash());
+        h.Add(s.Ants.ComputeHash());
+        return h.Value;
     }
 
     private static SimulationSession Load(byte[] bytes) => ExperimentSerializer.Load(new MemoryStream(bytes));
@@ -78,10 +112,10 @@ public class ExperimentV2SafetyTests(ITestOutputHelper output)
         Assert.Equal(AntSettings.None, loaded.AntSettings);
         Assert.Equal(3.5f, loaded.Scent.Field(0, LayerId.Surface)[17]);
 
-        var v2 = Save(loaded);
+        var v2 = SaveCurrent(loaded); // 저장은 현재 버전(v3)
         Assert.Equal(ExperimentSerializer.CurrentVersion, BinaryPrimitives.ReadUInt16LittleEndian(v2.AsSpan(8)));
-        Assert.Equal(2, ExperimentSerializer.CurrentVersion);
-        Assert.Equal(loaded.ComputeStateHash(), Load(v2).ComputeStateHash());
+        Assert.Equal(3, ExperimentSerializer.CurrentVersion);
+        Assert.Equal(StageAState(loaded), StageAState(Load(v2)));
 
         // 초기화해도 개미 0마리(v1 → 개미 없음 계약), 개미 설정 적용으로 다시 생성할 수 있다.
         loaded.Reset();
@@ -100,13 +134,13 @@ public class ExperimentV2SafetyTests(ITestOutputHelper output)
         var session = NewSession();
         session.Step(30);
         var first = Load(Save(session));
-        Assert.Equal(session.ComputeStateHash(), first.ComputeStateHash());
+        Assert.Equal(StageAState(session), StageAState(first));
         Assert.Equal(session.Ants.ComputeHash(), first.Ants.ComputeHash()); // ID·RNG·좌표·방향·속도 등 모든 필드
         first.Step(30);
         var second = Load(Save(first));
-        Assert.Equal(first.ComputeStateHash(), second.ComputeStateHash());
+        Assert.Equal(StageAState(first), StageAState(second));
         second.Step(30);
-        Assert.Equal(reference.ComputeStateHash(), second.ComputeStateHash());
+        Assert.Equal(StageAState(reference), StageAState(second));
     }
 
     /// <summary>개미 0 / 1 / 지원 최대(100,000)마리 경계 왕복.</summary>
@@ -122,7 +156,7 @@ public class ExperimentV2SafetyTests(ITestOutputHelper output)
         var bytes = Save(session);
         var loaded = Load(bytes);
         Assert.Equal(count, loaded.Ants.Count);
-        Assert.Equal(session.ComputeStateHash(), loaded.ComputeStateHash());
+        Assert.Equal(StageAState(session), StageAState(loaded));
         output.WriteLine($"개미 {count}마리: 파일 {bytes.Length}바이트");
     }
 
@@ -233,7 +267,7 @@ public class ExperimentV2SafetyTests(ITestOutputHelper output)
     public void InvalidAntField_IsRejected(string name, Action<byte[], AntLayout> corrupt)
     {
         var bytes = Save(NewSession(3));
-        Assert.Equal(Load(bytes).ComputeStateHash(), NewSession(3).ComputeStateHash()); // 손대기 전에는 정상
+        Assert.Equal(StageAState(Load(bytes)), StageAState(NewSession(3))); // 손대기 전에는 정상
         corrupt(bytes, AntLayout.Of(bytes, 3));
         Rechecksum(bytes);
         var error = Assert.Throws<MapFormatException>(() => Load(bytes));
@@ -316,15 +350,15 @@ public class ExperimentV2SafetyTests(ITestOutputHelper output)
         byte[] ra = Save(a), rb = Save(b);
         var map = AuditFiles.MapBytes(TestWorlds.Create(16, 16));
         byte[] v1 = AuditFiles.Experiment(1, map, map, new float[16 * 16 * 2]);
-        ulong v1Hash = Load(v1).ComputeStateHash();
+        ulong v1Hash = StageAState(Load(v1));
 
-        foreach (var (first, firstHash) in new[] { (ra, a.ComputeStateHash()), (v1, v1Hash) })
+        foreach (var (first, firstHash) in new[] { (ra, StageAState(a)), (v1, v1Hash) })
         {
             using var stream = Open(first.Concat(rb).ToArray(), maxPerRead);
-            Assert.Equal(firstHash, ExperimentSerializer.Load(stream).ComputeStateHash());
+            Assert.Equal(firstHash, StageAState(ExperimentSerializer.Load(stream)));
             if (stream is RecordingStream r1) Assert.Equal(first.Length, r1.Consumed);
             else Assert.Equal(first.Length, stream.Position);
-            Assert.Equal(b.ComputeStateHash(), ExperimentSerializer.Load(stream).ComputeStateHash());
+            Assert.Equal(StageAState(b), StageAState(ExperimentSerializer.Load(stream)));
             if (stream is RecordingStream r2) Assert.Equal(first.Length + rb.Length, r2.Consumed);
         }
         output.WriteLine($"{mode}: v2 A={ra.Length}, v2 B={rb.Length}, v1={v1.Length}");

@@ -88,6 +88,93 @@ public sealed class AntFrame
 }
 
 /// <summary>
+/// 선택한 개미 한 마리의 단계 B1 감각 상세(계산 스레드가 게시, 스냅샷과 함께 재사용). 10만 마리 감각 배열 전체를 복사하지 않고
+/// 이 개미 하나만 복사한다. <see cref="ResetCount"/>·<see cref="Id"/>는 요청한 선택이며, 화면은 자기 선택과 같을 때만 표시한다.
+/// </summary>
+public sealed class AntSenseDetail
+{
+    /// <summary>값이 들어 있는가(선택이 있고, 요청 세대가 게시 세대와 같고, 그 개미가 있다).</summary>
+    public bool HasValue { get; private set; }
+
+    /// <summary>선택 요청이 있었는가(값이 없어도 "개미 없음" 표시에 쓴다).</summary>
+    public bool Requested { get; private set; }
+
+    public long ResetCount { get; private set; } = -1;
+    public int Id { get; private set; } = -1;
+    public LayerId Layer { get; private set; }
+    public float X { get; private set; }
+    public float Y { get; private set; }
+    public float Heading { get; private set; }
+
+    /// <summary>다음 감지까지 남은 시간(초, (0, P]).</summary>
+    public float SenseTimer { get; private set; }
+
+    /// <summary>마지막 감지 틱(<see cref="AntPopulation.NotSensed"/>면 감지 전).</summary>
+    public long SenseTick { get; private set; }
+    public float SenseHeading { get; private set; }
+
+    /// <summary>마지막 감지의 센서별 차폐 비트(bit0 왼쪽 / 1 정면 / 2 오른쪽).</summary>
+    public byte SenseFlags { get; private set; }
+
+    public bool HasSensed => HasValue && SenseTick != AntPopulation.NotSensed;
+
+    /// <summary>감지 키(감지 값 배열 순서).</summary>
+    public IReadOnlyList<string> Keys { get; private set; } = Array.Empty<string>();
+
+    /// <summary>[k·3 + d] 농도(d = 0 왼쪽 / 1 정면 / 2 오른쪽). 길이는 최대 K·3.</summary>
+    public float[] Values { get; } = new float[AntSettings.MaxSensedTypes * AntPopulation.SensorCount];
+
+    public float Period { get; private set; }
+    public float Distance { get; private set; }
+    public float AngleDegrees { get; private set; }
+
+    /// <summary>현재 위치·방향 기준 센서 세 점(x0, y0, x1, y1, x2, y2)과 각 센서의 현재 차폐 비트(표시용, 상태와 무관하게 다시 계산).</summary>
+    public float[] SensorPoints { get; } = new float[2 * AntPopulation.SensorCount];
+    public byte SensorPointsBlocked { get; private set; }
+
+    public float Value(int type, int sensor) => Values[type * AntPopulation.SensorCount + sensor];
+
+    internal void Clear()
+    {
+        HasValue = Requested = false;
+        ResetCount = -1;
+        Id = -1;
+    }
+
+    internal void Fill(SimulationSession session, int id, long resetCount)
+    {
+        Requested = id >= 0;
+        Id = id;
+        ResetCount = resetCount;
+        HasValue = false;
+        if (id < 0 || resetCount != session.ResetCount) return; // 다른 세대의 선택 요청: 재사용된 같은 id를 보여 주지 않는다
+        var ants = session.Ants;
+        int i = ants.IndexOfId(id);
+        if (i < 0) return;
+        var info = ants.Get(i);
+        var sense = ants.GetSense(i, Values);
+        var config = session.Sensing;
+        Layer = info.Layer;
+        X = info.X;
+        Y = info.Y;
+        Heading = info.Heading;
+        SenseTimer = sense.SenseTimer;
+        SenseTick = sense.SenseTick;
+        SenseHeading = sense.SenseHeading;
+        SenseFlags = sense.Flags;
+        Keys = config.Keys;
+        Period = config.Period;
+        Distance = config.Distance;
+        AngleDegrees = config.AngleDegrees;
+        var cfg = session.World.Config;
+        AntSensing.Preview(info.X, info.Y, info.Heading, (int)info.Layer, session.SenseOpenMasks(), cfg.Width, cfg.Height, config,
+            SensorPoints, out byte blocked);
+        SensorPointsBlocked = blocked;
+        HasValue = true;
+    }
+}
+
+/// <summary>
 /// 계산 스레드가 게시한 냄새 필드 복사본(한 레이어, 선택한 냄새 종류들). 사용 후 <see cref="SimulationHost.Release"/>로 반납한다.
 /// 시뮬레이션 데이터와 메모리를 공유하지 않으므로 렌더링이 실제 농도를 바꿀 수 없다.
 /// 배열은 풀에서 재사용되며 종류별로 처음 필요할 때 한 번만 만든다.
@@ -118,6 +205,9 @@ public sealed class ScentSnapshot
 
     /// <summary>같은 틱·같은 초기화 세대의 개미 표시 데이터(히트맵 선택과 무관하게 항상 포함).</summary>
     public AntFrame Ants { get; } = new();
+
+    /// <summary>선택한 개미의 감각 상세(같은 틱). 선택 요청이 없거나 세대가 다르면 <see cref="AntSenseDetail.HasValue"/> = false.</summary>
+    public AntSenseDetail SelectedAnt { get; } = new();
 
     public bool Contains(int type) => Array.IndexOf(_types, type) >= 0;
 
@@ -183,6 +273,8 @@ public sealed class SimulationHost : IDisposable
     private int[] _heatmapTypes = { 0 };
     private LayerId _heatmapLayer;
     private volatile bool _publishRequested = true;
+    private int _selectedAntId = -1;          // _gate로 보호
+    private long _selectedAntResetCount = -1; // _gate로 보호
     private bool _ticksSincePublish;
     private long _tick;
     private double _lastTickMilliseconds;
@@ -264,6 +356,11 @@ public sealed class SimulationHost : IDisposable
         return RunExclusiveAsync(session =>
         {
             session.Reset(ants);
+            lock (_gate)
+            {
+                // 이전 세대의 선택은 초기화 뒤 의미가 없다(같은 id가 다른 개미에 재사용된다).
+                if (_selectedAntResetCount != session.ResetCount) _selectedAntId = -1;
+            }
             return new SimulationResetResult(session.World.Clone(), session.ResetCount, session.Tick, session.LastSpawn);
         });
     }
@@ -318,6 +415,24 @@ public sealed class SimulationHost : IDisposable
         }
         _wake.Set();
     }
+
+    /// <summary>
+    /// 감각 상세를 게시할 개미를 고른다(표시 선택, 시뮬레이션 상태에는 영향 없음). <paramref name="resetCount"/>는 화면이 그 개미를 고른
+    /// 스냅샷의 초기화 세대이며, 계산 스레드의 세대와 다르면(초기화 뒤 늦게 도착한 요청) 상세를 채우지 않는다.
+    /// </summary>
+    public void SelectAnt(int id, long resetCount)
+    {
+        lock (_gate)
+        {
+            _selectedAntId = id;
+            _selectedAntResetCount = resetCount;
+            _publishRequested = true;
+        }
+        _wake.Set();
+    }
+
+    /// <summary>감각 상세 선택을 지운다.</summary>
+    public void ClearAntSelection() => SelectAnt(-1, -1);
 
     /// <summary>새로 게시된 스냅샷이 있으면 가져온다. 다 쓴 뒤 <see cref="Release"/>로 반납해야 한다.</summary>
     public bool TryTakeSnapshot(out ScentSnapshot snapshot)
@@ -520,8 +635,12 @@ public sealed class SimulationHost : IDisposable
         int[] requested;
         LayerId layer;
         ScentSnapshot? snapshot;
+        int selectedId;
+        long selectedResetCount;
         lock (_gate)
         {
+            selectedId = _selectedAntId;
+            selectedResetCount = _selectedAntResetCount;
             _publishRequested = false;
             _ticksSincePublish = false;
             requested = _heatmapTypes;
@@ -537,6 +656,8 @@ public sealed class SimulationHost : IDisposable
             if ((uint)type < (uint)typeCount) types[count++] = type;
         snapshot.Fill(types[..count], _session.Scent, layer);
         snapshot.Ants.Fill(_session.Ants);
+        if (selectedId >= 0) snapshot.SelectedAnt.Fill(_session, selectedId, selectedResetCount);
+        else snapshot.SelectedAnt.Clear();
         snapshot.Tick = _session.Tick;
         snapshot.ElapsedSeconds = _session.ElapsedSeconds;
         snapshot.ResetCount = _session.ResetCount;

@@ -8,7 +8,14 @@ using AntSim.Core.Serialization;
 using AntSim.Core.Worlds;
 
 // 기준 성능 측정 도구. 최적화 전후 비교용이며 결과는 docs/BENCHMARKS.md에 기록한다.
-// 실행: dotnet run -c Release --project tools/AntSim.Benchmarks [-- <size> <iterations>]
+// 실행: dotnet run -c Release --project tools/AntSim.Benchmarks [-- <size> <iterations>]  |  [-- sensing [rounds]]
+
+// 단계 B1 감각 측정: dotnet run -c Release --project tools/AntSim.Benchmarks -- sensing [rounds]
+if (args.Length > 0 && args[0] == "sensing")
+{
+    SensingBenchmark.Run(args.Length > 1 ? int.Parse(args[1]) : 5);
+    return;
+}
 
 int size = args.Length > 0 ? int.Parse(args[0]) : 1024;
 int iterations = args.Length > 1 ? int.Parse(args[1]) : 7;
