@@ -74,7 +74,7 @@ public class StageB1ExperimentV3Tests(ITestOutputHelper output)
         straight.Step(37);
         session.Step(37);
         var bytes = Save(session);
-        Assert.Equal(3, BinaryPrimitives.ReadUInt16LittleEndian(bytes.AsSpan(8)));
+        Assert.Equal(ExperimentSerializer.CurrentVersion, BinaryPrimitives.ReadUInt16LittleEndian(bytes.AsSpan(8)));
         var loaded = Load(bytes);
         Assert.Equal(session.ComputeStateHash(), loaded.ComputeStateHash());
         Assert.Equal(session.Ants.ComputeStageBHash(), loaded.Ants.ComputeStageBHash());
@@ -178,7 +178,7 @@ public class StageB1ExperimentV3Tests(ITestOutputHelper output)
         }
         // 불러온 v2 상태는 v3로 저장되고, 다시 불러오면 같은 상태다.
         var v3 = Save(a);
-        Assert.Equal(3, BinaryPrimitives.ReadUInt16LittleEndian(v3.AsSpan(8)));
+        Assert.Equal(ExperimentSerializer.CurrentVersion, BinaryPrimitives.ReadUInt16LittleEndian(v3.AsSpan(8)));
         Assert.Equal(a.ComputeStateHash(), Load(v3).ComputeStateHash());
     }
 

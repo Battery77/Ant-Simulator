@@ -5,24 +5,34 @@ namespace AntSim.Core.Scent;
 
 /// <summary>
 /// 냄새 한 틱 계산. 종류마다 순서를 고정한다: 1) 4방향 확산 + 통로 교환 2) 지수 감쇠 3) 발생.
+/// 저장 배치는 레이어마다 다르다(<see cref="ScentGrid"/>, docs/PERF_SCENT_DESIGN.md).
 /// <list type="bullet">
-/// <item>확산: C'ᵢ = Cᵢ + D·dt·Σ(Cⱼ − Cᵢ), j는 맵 안의 비고체 4이웃. 고체 칸·맵 밖과는 교환하지 않는다(밀폐 경계).</item>
-/// <item>통로: 중심 좌표에서만, 두 레이어의 중심이 모두 비고체일 때 Dp·dt·(C반대 − C)를 교환한다.</item>
+/// <item>개미집(열린 칸 압축, 원래 해상도): C'ᵢ = Cᵢ + D·dt·Σ(Cⱼ − Cᵢ), j는 맵 안의 비고체 4이웃. 고체 칸·맵 밖과는 교환하지 않는다.
+/// 열린 칸만 계산하므로 비용은 판 칸 수에 비례한다.</item>
+/// <item>지상(F×F 묶음 격자): 같은 식을 묶음 칸 사이에 적용하되 교환율을 D·dt/F²로 보정한다(칸 간격이 F배). 묶음 칸 안에 비고체 칸이
+/// 하나라도 있으면 열린 묶음 칸이다. 발생은 묶음 칸 안 수량 합 / F²(평균 농도 단위)를 쓴다.</item>
+/// <item>통로: 중심 칸에서만, 두 레이어 모두 그 칸이 비고체일 때 Dp·dt·(C개미집 − C지상)을 교환한다. 지상 묶음 칸 쪽 변화는 1/F²로 나눠
+/// 총량(칸 단위)을 보존한다.</item>
 /// <item>감쇠: C ← C·exp(−k·dt). 발생: C ← C + e·dt·수량.</item>
-/// <item>고체 칸의 농도는 항상 0이다. 반올림으로 0 미만이 된 값은 0으로, 지원 상한(<see cref="ScentState.MaxConcentration"/>)을
-/// 반올림 여유(<see cref="RoundingSlackUlps"/>) 안에서 넘은 값은 상한으로 되돌린다.</item>
+/// <item>닫힌 칸(개미집 고체 칸은 저장 안 함, 닫힌 지상 묶음 칸)의 농도는 0이다. 반올림으로 0 미만이 된 값은 0으로,
+/// 지원 상한(<see cref="ScentState.MaxConcentration"/>)을 반올림 여유(<see cref="RoundingSlackUlps"/>) 안에서 넘은 값은 상한으로 되돌린다.</item>
 /// </list>
 /// 모든 계산은 Current만 읽고 Next에 쓴 뒤 교환하므로 순회 순서와 무관하며, 단일 스레드에서 항상 같은 결과를 낸다.
-/// 월드 타일 데이터는 청크 Version이 바뀐 청크만 레이어 전체 배열 캐시로 다시 복사한다.
+/// 월드 타일 데이터는 청크 Version이 바뀐 청크만 원래 해상도 캐시로 다시 복사하고, 바뀐 레이어만 배치·발생원을 다시 만든다.
 /// </summary>
 public sealed class ScentSystem
 {
     private readonly World _world;
-    private readonly byte[][] _open;          // [layer] 1 = 비고체
-    private readonly byte[][][] _quantities;  // [quantityKind][layer]
+    private readonly byte[][] _open;          // [layer] 원래 해상도, 1 = 비고체(감각의 벽 판정에도 쓴다)
+    private readonly byte[][][] _quantities;  // [quantityKind][layer] 원래 해상도
     private readonly long[][] _chunkVersions; // [layer][chunk], -1 = 미캐시
+    private readonly bool[] _openChanged = new bool[World.LayerCount];     // 고체 칸이 바뀜 → 배치 갱신
+    private readonly bool[] _quantityChanged = new bool[World.LayerCount]; // 청크가 바뀜 → 발생원 갱신
+    private readonly ScentGrid?[] _sourceGrid = new ScentGrid?[World.LayerCount]; // 발생원 배열을 만든 배치
+    private readonly float[][][] _sources;    // [quantityKind][layer] 배치 순서, 칸당 수량(지상은 묶음 칸 합 / F²)
     private int[] _passages = Array.Empty<int>();
     private long _passageVersion = -1;
+    private bool _cachesReady;
 
     public ScentSystem(World world)
     {
@@ -30,6 +40,7 @@ public sealed class ScentSystem
         int tiles = world.Config.TileCount;
         _open = new byte[World.LayerCount][];
         _quantities = new byte[TileEnums.QuantityKindCount][][];
+        _sources = new float[TileEnums.QuantityKindCount][][];
         _chunkVersions = new long[World.LayerCount][];
         for (int l = 0; l < World.LayerCount; l++)
         {
@@ -40,14 +51,19 @@ public sealed class ScentSystem
         for (int q = 0; q < _quantities.Length; q++)
         {
             _quantities[q] = new byte[World.LayerCount][];
-            for (int l = 0; l < World.LayerCount; l++) _quantities[q][l] = new byte[tiles];
+            _sources[q] = new float[World.LayerCount][];
+            for (int l = 0; l < World.LayerCount; l++)
+            {
+                _quantities[q][l] = new byte[tiles];
+                _sources[q][l] = Array.Empty<float>();
+            }
         }
     }
 
     public World World => _world;
 
     /// <summary>
-    /// 레이어별 냄새 열린 칸(1 = 비고체) 캐시. 감각 패스(<see cref="Ants.AntSensing"/>)가 읽는다. 반환 배열은 읽기 전용으로 쓴다.
+    /// 레이어별 원래 해상도 열린 칸(1 = 비고체) 캐시. 감각 패스(<see cref="Ants.AntSensing"/>)가 벽 판정에 읽는다. 반환 배열은 읽기 전용으로 쓴다.
     /// 캐시는 <see cref="Tick"/>이 매번 월드와 맞추며, 감각 패스는 같은 틱의 냄새 계산 직후에 실행되므로 다시 맞추지 않는다(추가 할당·순회 없음).
     /// 아직 한 번도 맞추지 않았거나 <paramref name="refresh"/>가 true면 지금 맞춘다(첫 틱 전 표시용 등).
     /// </summary>
@@ -57,46 +73,97 @@ public sealed class ScentSystem
         return _open;
     }
 
-    private bool _cachesReady;
-
     public void Tick(ScentState state, ScentSettings settings)
     {
         if (state.TypeCount != settings.Types.Count)
             throw new ArgumentException("냄새 상태와 설정의 종류 수가 다릅니다.", nameof(settings));
+        if (state.Config.Width != _world.Config.Width || state.Config.Height != _world.Config.Height)
+            throw new ArgumentException("냄새 상태와 월드의 크기가 다릅니다.", nameof(state));
         RefreshCaches();
+        Sync(state);
 
         double dt = settings.TickSeconds;
+        var surfaceGrid = state.Grid(LayerId.Surface);
+        var nestGrid = state.Grid(LayerId.Nest);
+        int f2 = surfaceGrid.CellSize * surfaceGrid.CellSize;
         for (int t = 0; t < settings.Types.Count; t++)
         {
             var type = settings.Types[t];
             float a = (float)(type.Diffusion * dt);
+            float aSurface = (float)(type.Diffusion * dt / f2);
             float ap = (float)(type.PassageDiffusion * dt);
             float decay = (float)Math.Exp(-type.Decay * dt);
             float emit = (float)(type.Emission * dt);
 
-            for (int l = 0; l < World.LayerCount; l++)
-                Diffuse(state.CurrentArray(t, (LayerId)l), state.NextArray(t, (LayerId)l), _open[l], a);
-
-            ExchangeThroughPassages(state, t, ap);
+            DiffuseCoarse(state.CurrentArray(t, LayerId.Surface), state.NextArray(t, LayerId.Surface), surfaceGrid, aSurface);
+            DiffuseSparse(state.CurrentArray(t, LayerId.Nest), state.NextArray(t, LayerId.Nest), nestGrid, a);
+            ExchangeThroughPassages(state, t, ap, f2);
 
             for (int l = 0; l < World.LayerCount; l++)
             {
-                byte[]? source = type.Source is { } kind ? _quantities[(int)kind][l] : null;
+                float[]? source = type.Source is { } kind ? _sources[(int)kind][l] : null;
                 DecayAndEmit(state.NextArray(t, (LayerId)l), decay, source, emit);
             }
         }
         state.Swap();
     }
 
-    private void Diffuse(float[] cur, float[] next, byte[] open, float a)
+    /// <summary>바뀐 레이어(또는 아직 맞추지 않은 냄새 상태)의 배치와 발생원 배열을 월드에 맞춘다.</summary>
+    private void Sync(ScentState state)
     {
+        for (int l = 0; l < World.LayerCount; l++)
+        {
+            var layer = (LayerId)l;
+            bool foreign = _sourceGrid[l] is null || !ReferenceEquals(_sourceGrid[l], state.Grid(layer));
+            if (_openChanged[l] || foreign)
+            {
+                var built = layer == LayerId.Surface ? ScentGrid.Coarse(_world.Config, _open[l]) : ScentGrid.Sparse(_world.Config, _open[l]);
+                state.UpdateLayout(layer, built); // 같은 배치면 기존 배치·값을 그대로 둔다
+            }
+            if (_openChanged[l] || foreign || _quantityChanged[l])
+            {
+                var grid = state.Grid(layer);
+                for (int q = 0; q < _quantities.Length; q++) _sources[q][l] = BuildSources(grid, _quantities[q][l]);
+                _sourceGrid[l] = grid;
+            }
+            _openChanged[l] = _quantityChanged[l] = false;
+        }
+    }
+
+    /// <summary>배치 순서의 발생원(칸당 수량). 묶음 격자는 열린 묶음 칸 안 수량 합 / F², 압축은 그 칸의 수량.</summary>
+    private float[] BuildSources(ScentGrid grid, byte[] quantity)
+    {
+        var config = _world.Config;
+        var sources = new float[grid.Length];
+        if (grid.IsSparse)
+        {
+            var tiles = grid.Tiles!;
+            for (int e = 0; e < tiles.Length; e++) sources[e] = quantity[tiles[e]];
+            return sources;
+        }
+        int f = grid.CellSize;
+        var open = grid.CellOpen!;
+        for (int y = 0; y < config.Height; y++)
+        {
+            int row = y * config.Width, cellRow = (y / f) * grid.Width;
+            for (int x = 0; x < config.Width; x++) sources[cellRow + x / f] += quantity[row + x];
+        }
+        float inv = 1f / (f * f); // f = 4: 1/16은 정확한 float
+        for (int c = 0; c < sources.Length; c++) sources[c] = open[c] != 0 ? sources[c] * inv : 0;
+        return sources;
+    }
+
+    /// <summary>묶음 격자 확산(교환율 a = D·dt/F²). 닫힌 묶음 칸은 0, 열린 이웃끼리만 교환한다.</summary>
+    private static void DiffuseCoarse(float[] cur, float[] next, ScentGrid grid, float a)
+    {
+        var open = grid.CellOpen!;
+        int w = grid.Width, h = grid.Height;
         if (a == 0)
         {
             // 확산 계수 0: 이웃 차이를 계산하지 않는다(c + 0·Σ와 같은 값이며, 큰 농도에서 Σ가 넘쳐 0·∞ = NaN이 되는 연산을 피한다).
             for (int i = 0; i < cur.Length; i++) next[i] = open[i] != 0 ? cur[i] : 0;
             return;
         }
-        int w = _world.Config.Width, h = _world.Config.Height;
         for (int y = 0; y < h; y++)
         {
             int row = y * w;
@@ -120,7 +187,30 @@ public sealed class ScentSystem
         }
     }
 
-    private void ExchangeThroughPassages(ScentState state, int type, float ap)
+    /// <summary>열린 칸 압축 확산. 이웃 순서(왼쪽, 오른쪽, 위, 아래)와 식은 원래 해상도 전체 순회와 같아 같은 값을 낸다.</summary>
+    private static void DiffuseSparse(float[] cur, float[] next, ScentGrid grid, float a)
+    {
+        if (a == 0)
+        {
+            cur.AsSpan().CopyTo(next);
+            return;
+        }
+        var neighbors = grid.Neighbors!;
+        for (int i = 0; i < cur.Length; i++)
+        {
+            float c = cur[i];
+            float flux = 0;
+            int o = 4 * i;
+            int n0 = neighbors[o], n1 = neighbors[o + 1], n2 = neighbors[o + 2], n3 = neighbors[o + 3];
+            if (n0 >= 0) flux += cur[n0] - c;
+            if (n1 >= 0) flux += cur[n1] - c;
+            if (n2 >= 0) flux += cur[n2] - c;
+            if (n3 >= 0) flux += cur[n3] - c;
+            next[i] = c + a * flux;
+        }
+    }
+
+    private void ExchangeThroughPassages(ScentState state, int type, float ap, int f2)
     {
         if (_passages.Length == 0 || ap == 0) return;
         var curS = state.CurrentArray(type, LayerId.Surface);
@@ -129,12 +219,19 @@ public sealed class ScentSystem
         var nextN = state.NextArray(type, LayerId.Nest);
         var openS = _open[(int)LayerId.Surface];
         var openN = _open[(int)LayerId.Nest];
+        var surface = state.Grid(LayerId.Surface);
+        var nest = state.Grid(LayerId.Nest);
+        int width = _world.Config.Width;
+        float inv = 1f / f2;
         foreach (int i in _passages)
         {
             if (openS[i] == 0 || openN[i] == 0) continue;
-            float flow = ap * (curN[i] - curS[i]);
-            nextS[i] += flow;
-            nextN[i] -= flow;
+            int x = i % width, y = i / width;
+            int s = surface.IndexOf(x, y), n = nest.IndexOf(x, y);
+            if (s < 0 || n < 0) continue;
+            float flow = ap * (curN[n] - curS[s]);
+            nextS[s] += flow * inv;
+            nextN[n] -= flow;
         }
     }
 
@@ -170,10 +267,10 @@ public sealed class ScentSystem
     }
 
     /// <summary>
-    /// 감쇠·발생과 범위 정리: next ← clamp(next·decay [+ emit·수량]). 매 틱 모든 칸을 지나는 경로라 벡터로 계산하고 나머지는 스칼라로 처리한다.
-    /// 곱·합은 원소마다 같은 IEEE 단정도 연산(융합 없음)이므로 스칼라 계산과 비트 단위로 같다.
+    /// 감쇠·발생과 범위 정리: next ← clamp(next·decay [+ emit·수량]). 매 틱 모든 저장 칸을 지나는 경로라 벡터로 계산하고 나머지는 스칼라로 처리한다.
+    /// 곱·합은 원소마다 같은 IEEE 단정도 연산(융합 없음)이므로 스칼라 계산과 비트 단위로 같다. 수량은 배치 순서의 칸당 수량(float)이다.
     /// </summary>
-    internal static void DecayAndEmit(float[] next, float decay, byte[]? source, float emit)
+    internal static void DecayAndEmit(float[] next, float decay, float[]? source, float emit)
     {
         int i = 0;
         var vDecay = new Vector<float>(decay);
@@ -185,27 +282,11 @@ public sealed class ScentSystem
             for (; i < next.Length; i++) next[i] = ClampToSupported(next[i] * decay);
             return;
         }
-
         if (Vector.IsHardwareAccelerated)
         {
             var vEmit = new Vector<float>(emit);
-            int floats = Vector<float>.Count;
-            for (; i <= next.Length - Vector<byte>.Count; i += Vector<byte>.Count)
-            {
-                Vector.Widen(new Vector<byte>(source, i), out var low, out var high);
-                Vector.Widen(low, out var q0, out var q1);
-                Vector.Widen(high, out var q2, out var q3);
-                Apply(i, q0);
-                Apply(i + floats, q1);
-                Apply(i + 2 * floats, q2);
-                Apply(i + 3 * floats, q3);
-            }
-
-            void Apply(int at, Vector<uint> quantity)
-            {
-                var q = Vector.ConvertToSingle(Vector.AsVectorInt32(quantity)); // 0~255라 정확히 변환
-                ClampToSupported(new Vector<float>(next, at) * vDecay + vEmit * q).CopyTo(next, at);
-            }
+            for (; i <= next.Length - Vector<float>.Count; i += Vector<float>.Count)
+                ClampToSupported(new Vector<float>(next, i) * vDecay + vEmit * new Vector<float>(source, i)).CopyTo(next, i);
         }
         for (; i < next.Length; i++) next[i] = ClampToSupported(next[i] * decay + emit * source[i]);
     }
@@ -224,12 +305,21 @@ public sealed class ScentSystem
                 var chunk = layer.Chunks[c];
                 if (versions[c] == chunk.Version) continue;
                 versions[c] = chunk.Version;
+                _quantityChanged[l] = true;
                 for (int ly = 0; ly < chunk.ValidHeight; ly++)
                 {
                     int dst = (chunk.OriginY + ly) * config.Width + chunk.OriginX;
                     var solid = chunk.Row(TilePlane.Solid, ly);
                     var open = _open[l].AsSpan(dst, chunk.ValidWidth);
-                    for (int x = 0; x < solid.Length; x++) open[x] = solid[x] == 0 ? (byte)1 : (byte)0;
+                    for (int x = 0; x < solid.Length; x++)
+                    {
+                        byte value = solid[x] == 0 ? (byte)1 : (byte)0;
+                        if (open[x] != value)
+                        {
+                            open[x] = value;
+                            _openChanged[l] = true;
+                        }
+                    }
                     chunk.Row(TilePlane.Food, ly).CopyTo(_quantities[(int)QuantityKind.Food][l].AsSpan(dst));
                     chunk.Row(TilePlane.Larva, ly).CopyTo(_quantities[(int)QuantityKind.Larva][l].AsSpan(dst));
                 }

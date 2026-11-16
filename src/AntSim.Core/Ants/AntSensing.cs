@@ -49,7 +49,7 @@ public sealed class AntSensingConfig
 /// <list type="bullet">
 /// <item>스케줄: 개미별 카운트다운. 감지한 틱 뒤 타이머는 항상 (0, P]이며 한 틱에 한 번만 감지한다. 난수를 쓰지 않는다.</item>
 /// <item>센서: 왼쪽(Heading − θ) / 정면 / 오른쪽(Heading + θ), 개미 위치에서 거리 d.</item>
-/// <item>샘플링: 센서점이 있는 칸의 농도를 그대로 읽는다(보간 없음). 센서 칸이 맵 밖이거나 고체면 그 센서는 값 0, 차폐 비트 1.
+/// <item>샘플링: 센서점이 있는 칸의 농도를 그대로 읽는다(보간 없음, 지상은 그 칸이 속한 묶음 칸 값 — <see cref="ScentGrid"/>). 센서 칸이 맵 밖이거나 고체면 그 센서는 값 0, 차폐 비트 1.
 /// 물은 가리지 않는다(냄새 확산과 같은 "고체 = 막힘"). 개미와 센서 칸 사이의 칸은 보지 않는다(거리 2에서는 얇은 벽 너머 칸을 읽을 수 있다).
 /// 센서 칸 판정은 센서마다 한 번 하고 K개 종류가 공유한다.</item>
 /// <item>개미가 있는 레이어의 농도만 읽는다. 이동 상태(위치·방향·이동 난수)는 읽기만 한다.</item>
@@ -123,8 +123,11 @@ public static class AntSensing
                     for (int t = 0; t < k; t++) output[t * AntPopulation.SensorCount + d] = 0;
                     continue;
                 }
+                // 냄새 저장 배치로 옮긴다(지상 묶음 칸 / 개미집 압축 인덱스). 센서 칸은 비고체라 개미집에서도 저장되어 있다
+                // (배치가 아직 월드와 맞지 않은 경우에만 −1 → 0).
+                int stored = scent.Grid((LayerId)layer).IndexOf(tile % width, tile / width);
                 for (int t = 0; t < k; t++)
-                    output[t * AntPopulation.SensorCount + d] = scent.CurrentArray(types[t], (LayerId)layer)[tile];
+                    output[t * AntPopulation.SensorCount + d] = stored < 0 ? 0 : scent.CurrentArray(types[t], (LayerId)layer)[stored];
             }
             flags[i] = blocked;
         }

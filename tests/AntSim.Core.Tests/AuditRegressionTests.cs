@@ -431,10 +431,11 @@ public class AuditF03NumericRangeTests
         var world = TestWorlds.Create(5, 5);
         var system = new ScentSystem(world);
         var state = new ScentState(world.Config, 1);
-        state.MutableField(0, LayerId.Surface)[world.Config.ToLinearIndex(2, 2)] = 1e38f;
+        // 원래 해상도(개미집)에서 확인한다. 지상은 묶음 격자라 (1,2)와 (2,2)가 같은 값이다.
+        Assert.True(state.Set(0, LayerId.Nest, 2, 2, 1e38f));
         system.Tick(state, settings);
-        Assert.Equal(1e38f, state.Get(0, LayerId.Surface, 2, 2));
-        Assert.Equal(0f, state.Get(0, LayerId.Surface, 1, 2));
+        Assert.Equal(1e38f, state.Get(0, LayerId.Nest, 2, 2));
+        Assert.Equal(0f, state.Get(0, LayerId.Nest, 1, 2));
     }
 
     [Fact]
@@ -535,8 +536,9 @@ public class AuditF04SmallLogTests
     public void UiScenario_HighDecay_ProducesDrawableMaximum()
     {
         // 감사 재현: D=Dp=0, k=100, dt=0.1로 한 번 발생(0.1) 후 e=0으로 두 틱 → 최대 약 2.06e-10.
+        // 원래 해상도(개미집)의 발생원 한 칸. 지상은 묶음 칸 평균(수량 / F²)이라 최대값이 F²배 작아진다.
         var world = TestWorlds.Create(8, 8);
-        world.Surface.TrySetState(3, 3, new TileState(Terrain.Dirt, SolidBlock.None, 1, 0));
+        world.Nest.TrySetState(3, 3, new TileState(Terrain.Dirt, SolidBlock.None, 1, 0));
         var emit = new ScentSettings { Types = new[] { new ScentTypeSettings("food", "음식", QuantityKind.Food, 0, 0, 100, 1) } };
         var quiet = emit.WithType(0, emit.Types[0] with { Emission = 0 });
         var system = new ScentSystem(world);
@@ -544,7 +546,7 @@ public class AuditF04SmallLogTests
         system.Tick(state, emit);
         system.Tick(state, quiet);
         system.Tick(state, quiet);
-        float max = HeatmapRasterizer.ComputeMax(state.Field(0, LayerId.Surface));
+        float max = HeatmapRasterizer.ComputeMax(state.Field(0, LayerId.Nest));
         Assert.InRange(max, 1e-10f, 1e-9f);
         Assert.Equal(255, new HeatmapQuantizer(max, HeatmapScale.Log).Quantize(max));
     }

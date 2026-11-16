@@ -12,7 +12,8 @@ namespace AntSim.Core.Serialization;
 /// v2는 v1 끝(냄새 다음, 체크섬 앞)에 개미 설정과 개체 상태를 추가했다. v3는 v2 끝(개미 다음, 체크섬 앞)에 단계 B 설정과
 /// 개미별 단계 B 상태(감각, 경로 적분)를 추가했다(B1이 B2 필드까지 전체 레이아웃을 정의하며, 이후 레이아웃·의미를 바꾸면 새 버전).
 /// v1 파일은 월드·냄새·틱·경과 시간을 그대로 두고 개미 0마리(<see cref="AntSettings.None"/>)로, v1/v2 파일의 단계 B 상태는
-/// 생성 때와 같은 결정적 초기값으로 불러온다. 저장은 항상 v3다.
+/// 생성 때와 같은 결정적 초기값으로 불러온다. v4는 냄새 구간만 다르다(지상 묶음 격자 + 개미집 열린 칸, docs/PERF_SCENT_DESIGN.md).
+/// v1~v3의 원래 해상도 냄새는 불러올 때 변환한다. 저장은 항상 v4다.
 /// <code>
 /// [v1]
 /// magic        8 bytes  "ANTEXP\0\0"
@@ -25,7 +26,9 @@ namespace AntSim.Core.Serialization;
 ///              (string = i32 UTF-8 바이트 길이 + 바이트)
 /// initialWorld i32 length + 맵 파일 형식(MapSerializer) 바이트
 /// currentWorld i32 length + 맵 파일 형식 바이트
-/// scent        typeCount × 레이어 2 × (width*height) × f32   (종류 순서 = settings, 레이어 순서 Surface, Nest)
+/// scent        typeCount × 레이어 2 × (width*height) × f32   (종류 순서 = settings, 레이어 순서 Surface, Nest; v1~v3)
+///              v4: i32 cellSize(= 4), i32 nestOpenCount,
+///                  typeCount × { 지상 묶음 격자 ⌈W/4⌉·⌈H/4⌉ × f32, 개미집 열린 칸(현재 월드, 행 우선) nestOpenCount × f32 }
 /// checksum     u64      위 모든 바이트의 FNV-1a 64
 ///
 /// [v2] = v1 + (scent 다음, checksum 앞에)
@@ -46,8 +49,8 @@ namespace AntSim.Core.Serialization;
 /// </summary>
 public static class ExperimentSerializer
 {
-    /// <summary>저장 형식 버전. 저장은 항상 이 버전(v3)으로 하고, 불러오기는 v1(개미 구간 없음)·v2(단계 B 구간 없음)·v3를 지원한다.</summary>
-    public const ushort CurrentVersion = 3;
+    /// <summary>저장 형식 버전. 저장은 항상 이 버전(v4)으로 하고, 불러오기는 v1(개미 구간 없음)·v2(단계 B 구간 없음)·v3(원래 해상도 냄새)·v4를 지원한다.</summary>
+    public const ushort CurrentVersion = 4;
 
     /// <summary>냄새 종류 수 상한(<see cref="ScentSettings.MaxTypes"/>와 같다: 저장할 수 있으면 불러올 수 있다).</summary>
     public const int MaxScentTypes = ScentSettings.MaxTypes;
@@ -100,9 +103,7 @@ public static class ExperimentSerializer
         WriteWorld(writer, session.InitialWorld);
         WriteWorld(writer, session.World);
 
-        for (int t = 0; t < session.Scent.TypeCount; t++)
-        for (int l = 0; l < World.LayerCount; l++)
-            writer.Write(MemoryMarshal.AsBytes(session.Scent.Field(t, (LayerId)l)));
+        WriteScent(writer, session);
 
         WriteAntSettings(writer, session.AntSettings);
         WriteAnts(writer, session.Ants);
@@ -219,20 +220,7 @@ public static class ExperimentSerializer
         if (initial.Config.Width != current.Config.Width || initial.Config.Height != current.Config.Height)
             throw new MapFormatException("시작 월드와 현재 월드의 크기가 다릅니다.");
 
-        // 냄새 배열(Current/Next)을 만들기 전에 농도 본문 전체가 실제로 있는지 확인한다.
-        // 종류 ≤ 256, 타일 ≤ 2^28이므로 long 곱은 넘치지 않는다.
-        long scentBytes = (long)typeCount * World.LayerCount * current.Config.TileCount * sizeof(float);
-        StreamLimits.Require(stream, scentBytes + 8, "냄새 농도");
-        var scent = new ScentState(current.Config, typeCount);
-        for (int t = 0; t < typeCount; t++)
-        for (int l = 0; l < World.LayerCount; l++)
-        {
-            var field = scent.MutableField(t, (LayerId)l);
-            reader.Read(MemoryMarshal.AsBytes(field));
-            foreach (float v in field)
-                if (!(v >= 0 && v <= ScentState.MaxConcentration))
-                    throw new MapFormatException($"냄새 농도에 지원 범위(0 ~ {ScentState.MaxConcentration:0e0}) 밖의 값(음수·NaN·무한대 포함)이 있습니다.");
-        }
+        var scent = version >= 4 ? ReadScent(reader, current, typeCount) : ReadLegacyScent(reader, current, typeCount);
 
         var antSettings = AntSettings.None;
         var ants = new AntPopulation();
@@ -259,6 +247,98 @@ public static class ExperimentSerializer
         if ((ants.Count > 0 || antSettings.InitialCount > 0) && !AntSettings.SupportsTick(tickSeconds))
             throw new MapFormatException(AntSettings.TickNotSupportedMessage(tickSeconds));
         return new SimulationSession(initial, current, settings, scent, tick, elapsed, antSettings, ants);
+    }
+
+    /// <summary>
+    /// v4 냄새 구간: i32 cellSize, i32 nestOpenCount, 종류마다 { 지상 묶음 격자 ⌈W/F⌉·⌈H/F⌉ × f32, 개미집 열린 칸 nestOpenCount × f32 }.
+    /// 개미집 값은 현재 월드의 열린 칸을 행 우선으로 센 순서다(냄새 상태의 배치가 아직 월드와 맞지 않아도 같은 기준으로 쓴다).
+    /// </summary>
+    private static void WriteScent(ChecksumWriter writer, SimulationSession session)
+    {
+        var state = session.Scent;
+        var config = session.World.Config;
+        var nest = ScentGrid.Sparse(config, ScentGrid.OpenMask(session.World.Nest));
+        var surface = state.Grid(LayerId.Surface);
+        writer.WriteInt32(surface.CellSize);
+        writer.WriteInt32(nest.Length);
+        var buffer = new float[nest.Length];
+        for (int t = 0; t < state.TypeCount; t++)
+        {
+            writer.Write(MemoryMarshal.AsBytes(state.Field(t, LayerId.Surface)));
+            var tiles = nest.Tiles!;
+            for (int e = 0; e < tiles.Length; e++) buffer[e] = state.Get(t, LayerId.Nest, tiles[e] % config.Width, tiles[e] / config.Width);
+            writer.Write(MemoryMarshal.AsBytes(buffer.AsSpan()));
+        }
+    }
+
+    private static void CheckRange(ReadOnlySpan<float> values)
+    {
+        foreach (float v in values)
+            if (!(v >= 0 && v <= ScentState.MaxConcentration))
+                throw new MapFormatException($"냄새 농도에 지원 범위(0 ~ {ScentState.MaxConcentration:0e0}) 밖의 값(음수·NaN·무한대 포함)이 있습니다.");
+    }
+
+    /// <summary>v4 냄새 구간. 배치는 현재 월드에서 다시 만들고, 파일의 묶음 크기·열린 칸 수와 맞는지 확인한 뒤 할당 전에 본문 길이를 확인한다.</summary>
+    private static ScentState ReadScent(ChecksumReader reader, World world, int typeCount)
+    {
+        StreamLimits.Require(reader.BaseStream, 8, "냄새 배치");
+        int cellSize = reader.ReadInt32();
+        int nestCount = reader.ReadInt32();
+        if (cellSize != ScentGrid.SurfaceCellSize)
+            throw new MapFormatException($"지상 냄새 묶음 크기가 잘못되었습니다: {cellSize} (지원: {ScentGrid.SurfaceCellSize}).");
+        if (nestCount < 0 || nestCount > world.Config.TileCount) throw new MapFormatException($"개미집 냄새 칸 수가 잘못되었습니다: {nestCount}.");
+        var scent = new ScentState(world, typeCount);
+        if (nestCount != scent.Grid(LayerId.Nest).Length)
+            throw new MapFormatException($"개미집 냄새 칸 수({nestCount})가 내장 월드의 열린 칸 수({scent.Grid(LayerId.Nest).Length})와 다릅니다.");
+        // 종류 ≤ 256, 저장 칸 ≤ 2^28 + 2^24이므로 long 곱은 넘치지 않는다.
+        long perType = (long)scent.Grid(LayerId.Surface).Length + nestCount;
+        StreamLimits.Require(reader.BaseStream, typeCount * perType * sizeof(float) + 8, "냄새 농도");
+        for (int t = 0; t < typeCount; t++)
+        for (int l = 0; l < World.LayerCount; l++)
+        {
+            var field = scent.MutableField(t, (LayerId)l);
+            reader.Read(MemoryMarshal.AsBytes(field));
+            CheckRange(field);
+        }
+        return scent;
+    }
+
+    /// <summary>
+    /// v1~v3 냄새 구간(종류 × 레이어 × W·H, 원래 해상도)을 읽어 변환한다. 지상은 묶음 칸 안 값의 합 / F²(평균 농도, 총량 보존),
+    /// 개미집은 열린 칸의 값만 고른다. 결정적이다.
+    /// </summary>
+    private static ScentState ReadLegacyScent(ChecksumReader reader, World world, int typeCount)
+    {
+        var config = world.Config;
+        // 냄새 배열을 만들기 전에 농도 본문 전체가 실제로 있는지 확인한다. 종류 ≤ 256, 타일 ≤ 2^28이므로 long 곱은 넘치지 않는다.
+        long scentBytes = (long)typeCount * World.LayerCount * config.TileCount * sizeof(float);
+        StreamLimits.Require(reader.BaseStream, scentBytes + 8, "냄새 농도");
+        var scent = new ScentState(world, typeCount);
+        var buffer = new float[config.TileCount];
+        var surface = scent.Grid(LayerId.Surface);
+        var nest = scent.Grid(LayerId.Nest);
+        int f = surface.CellSize;
+        var sums = new double[surface.Length];
+        for (int t = 0; t < typeCount; t++)
+        {
+            reader.Read(MemoryMarshal.AsBytes(buffer.AsSpan()));
+            CheckRange(buffer);
+            Array.Clear(sums);
+            for (int y = 0; y < config.Height; y++)
+            {
+                int row = y * config.Width, cellRow = (y / f) * surface.Width;
+                for (int x = 0; x < config.Width; x++) sums[cellRow + x / f] += buffer[row + x];
+            }
+            var coarse = scent.MutableField(t, LayerId.Surface);
+            for (int c = 0; c < coarse.Length; c++) coarse[c] = (float)(sums[c] / (f * f));
+
+            reader.Read(MemoryMarshal.AsBytes(buffer.AsSpan()));
+            CheckRange(buffer);
+            var compact = scent.MutableField(t, LayerId.Nest);
+            var tiles = nest.Tiles!;
+            for (int e = 0; e < tiles.Length; e++) compact[e] = buffer[tiles[e]];
+        }
+        return scent;
     }
 
     private static void WriteAntSettings(ChecksumWriter writer, AntSettings s)

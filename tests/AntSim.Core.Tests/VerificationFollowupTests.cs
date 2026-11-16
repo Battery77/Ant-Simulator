@@ -287,7 +287,10 @@ public class VerificationF03ConcentrationBoundaryTests(ITestOutputHelper output)
 {
     private static readonly int MaxBits = BitConverter.SingleToInt32Bits(ScentState.MaxConcentration);
 
-    /// <summary>재검증 T2 입력: 양쪽 레이어가 열린 5×5, (2,2) 통로(선택), 1종, 지상 중심 0, 지상 4이웃·지하 중심 = c.</summary>
+    /// <summary>
+    /// 재검증 T2 입력: 양쪽 레이어가 열린 5×5, (2,2) 통로(선택), 1종. 원래 해상도 쪽(개미집) 중심 0, 개미집 4이웃 = c, 반대 레이어(지상) = c.
+    /// (냄새 격자 변경 뒤 원래 해상도는 개미집에만 남아 레이어를 바꿨다. 중심 칸이 받는 양은 (4D + Dp)·dt·c로 같다.)
+    /// </summary>
     private static SimulationSession BoundarySession(double dt, double d, double dp, float c, bool passage = true)
     {
         var world = TestWorlds.Create(5, 5);
@@ -299,9 +302,8 @@ public class VerificationF03ConcentrationBoundaryTests(ITestOutputHelper output)
         };
         Assert.Empty(settings.Validate());
         var session = new SimulationSession(world, settings);
-        var surface = session.Scent.MutableField(0, LayerId.Surface);
-        foreach (var (x, y) in new[] { (1, 2), (3, 2), (2, 1), (2, 3) }) surface[world.Config.ToLinearIndex(x, y)] = c;
-        session.Scent.MutableField(0, LayerId.Nest)[world.Config.ToLinearIndex(2, 2)] = c;
+        foreach (var (x, y) in new[] { (1, 2), (3, 2), (2, 1), (2, 3) }) Assert.True(session.Scent.Set(0, LayerId.Nest, x, y, c));
+        Assert.True(session.Scent.Set(0, LayerId.Surface, 2, 2, c));
         return session;
     }
 
@@ -321,7 +323,7 @@ public class VerificationF03ConcentrationBoundaryTests(ITestOutputHelper output)
 
         loaded.Step();
         Assert.Equal(1, loaded.Tick);
-        float center = loaded.Scent.Get(0, LayerId.Surface, 2, 2);
+        float center = loaded.Scent.Get(0, LayerId.Nest, 2, 2);
         foreach (var layer in new[] { LayerId.Surface, LayerId.Nest })
             Assert.All(loaded.Scent.Field(0, layer).ToArray(), v => Assert.True(float.IsFinite(v) && v >= 0 && v <= ScentState.MaxConcentration,
                 $"범위 밖 값 {v:R} (0x{BitConverter.SingleToInt32Bits(v):X8})"));
@@ -330,7 +332,7 @@ public class VerificationF03ConcentrationBoundaryTests(ITestOutputHelper output)
         var second = Save(loaded);
         var reloaded = ExperimentSerializer.Load(new MemoryStream(second));
         Assert.Equal(loaded.ComputeStateHash(), reloaded.ComputeStateHash());
-        Assert.Equal(center, reloaded.Scent.Get(0, LayerId.Surface, 2, 2));
+        Assert.Equal(center, reloaded.Scent.Get(0, LayerId.Nest, 2, 2));
         output.WriteLine($"{label}: center={center:R} bits=0x{BitConverter.SingleToInt32Bits(center):X8} " +
                          $"(max 0x{MaxBits:X8}, diff {BitConverter.SingleToInt32Bits(center) - MaxBits} ULP), second save {second.Length} bytes OK");
         return center;
@@ -419,7 +421,7 @@ public class VerificationF03ConcentrationBoundaryTests(ITestOutputHelper output)
 
         // 지원 범위 밖 상태(2e30)는 한 틱 뒤에도 상한으로 숨겨지지 않는다 → 저장 거부 유지.
         var session = BoundarySession(1, 0.012, 0.952, 1f);
-        session.Scent.MutableField(0, LayerId.Nest)[session.World.Config.ToLinearIndex(0, 0)] = 2e30f;
+        Assert.True(session.Scent.Set(0, LayerId.Nest, 0, 0, 2e30f));
         session.Step();
         Assert.False(session.Scent.AllValuesInSupportedRange());
         Assert.Throws<InvalidOperationException>(() => ExperimentSerializer.Save(session, new MemoryStream()));
@@ -454,7 +456,7 @@ public class VerificationF03ConcentrationBoundaryTests(ITestOutputHelper output)
                 source[i] = (byte)rng.Next(256);
             }
             var actual = (float[])input.Clone();
-            ScentSystem.DecayAndEmit(actual, decay, withSource ? source : null, emit);
+            ScentSystem.DecayAndEmit(actual, decay, withSource ? source.Select(b => (float)b).ToArray() : null, emit);
             for (int i = 0; i < length; i++)
             {
                 float raw = withSource && emit != 0 ? input[i] * decay + emit * source[i] : input[i] * decay;
@@ -483,8 +485,7 @@ public class VerificationF03ConcentrationBoundaryTests(ITestOutputHelper output)
         for (int i = 0; i < 100; i++) system.Tick(state, settings);
         Assert.Equal(before, Total(state), before * 1e-5);
 
-        static double Total(ScentState s) =>
-            s.Field(0, LayerId.Surface).ToArray().Sum(v => (double)v) + s.Field(0, LayerId.Nest).ToArray().Sum(v => (double)v);
+        static double Total(ScentState s) => s.Total(0); // 지상 묶음 칸은 F² 칸의 평균이라 칸 단위로 환산한 총량
     }
 }
 

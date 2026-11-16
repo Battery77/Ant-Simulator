@@ -199,7 +199,7 @@ public partial class Main
         if (_snapshot is { } s && s.Layer == _view.Layer)
         {
             // 표시 색이 아니라 실제 농도 값을 보여 준다(복합 모드에서는 모든 냄새).
-            int index = _simWorld.Config.ToLinearIndex(t.X, t.Y);
+            int index = s.FieldIndex(t.X, t.Y); // 지상은 그 칸이 속한 묶음 칸
             foreach (int type in s.Types)
                 if (type < _scentSettings.Types.Count)
                     info += $"\n냄새({_scentSettings.Types[type].DisplayName}): {s.Field(type)[index]:0.#####}";
@@ -355,11 +355,10 @@ public partial class Main
         }
         _simPanel.SetLegendValues(_legendEntries);
 
-        var config = _simWorld.Config;
         if (options.Mode == HeatmapMode.Single)
         {
             var entry = _legendEntries[0];
-            _heatmap.ShowField(s.Field(entry.TypeIndex), config.Width, config.Height, entry.ShownMax, options.Scale);
+            _heatmap.ShowField(s.Field(entry.TypeIndex), s.FieldWidth, s.FieldHeight, s.CellSize, entry.ShownMax, options.Scale);
             return;
         }
 
@@ -370,7 +369,7 @@ public partial class Main
             _channels[i] = new CompositeChannel(s.Field(type), _legendEntries[i].ShownMax, options.Scale,
                 _compositePalette.Get(_scentSettings.Types[type].Key));
         }
-        _heatmap.ShowComposite(_channels, config.Width, config.Height, _compositeRasterizer);
+        _heatmap.ShowComposite(_channels, s.FieldWidth, s.FieldHeight, s.CellSize, _compositeRasterizer);
     }
 
     /// <summary>히트맵 모드가 필요로 하는 냄새 종류(숨김이면 빈 배열 → 계산 스레드가 필드를 복사하지 않음).</summary>
@@ -538,7 +537,7 @@ public partial class Main
     }
 
     /// <summary>
-    /// 실험 저장(대화상자·Ctrl+S 공용). 계산 스레드의 명령으로 틱 사이에 저장하며(<see cref="ExperimentSerializer"/>, v3, 임시 파일 교체),
+    /// 실험 저장(대화상자·Ctrl+S 공용). 계산 스레드의 명령으로 틱 사이에 저장하며(<see cref="ExperimentSerializer"/>, v4, 임시 파일 교체),
     /// 저장이 실제로 끝난 뒤에만 성공을 알린다. 성공한 경로는 이후 Ctrl+S 빠른 저장 대상이 된다.
     /// </summary>
     private async Task SaveExperiment(string path)
@@ -564,7 +563,7 @@ public partial class Main
     }
 
     /// <summary>
-    /// Ctrl+S(시뮬레이션 모드): 이 실험을 저장한 적이 있거나 현재 형식(v3) 파일에서 불러왔으면 그 파일에 바로 저장, 아니면 저장 대화상자.
+    /// Ctrl+S(시뮬레이션 모드): 이 실험을 저장한 적이 있거나 현재 형식(v4) 파일에서 불러왔으면 그 파일에 바로 저장, 아니면 저장 대화상자.
     /// 맵 파일 경로(<see cref="_currentPath"/>)와는 따로 관리한다.
     /// </summary>
     private void QuickSaveExperiment()
@@ -584,15 +583,15 @@ public partial class Main
             var previous = _host;
             StartSimulation(loaded);
             if (_host is null || _host == previous) return;
-            // 현재 형식(v3) 파일이면 Ctrl+S가 그 파일에 저장한다. v1/v2 파일은 저장 형식이 달라지므로 원본을 보존하도록
-            // 빠른 저장 대상으로 삼지 않는다(Ctrl+S는 저장 대화상자를 열어 새 이름으로 v3 저장을 유도).
+            // 현재 형식(v4) 파일이면 Ctrl+S가 그 파일에 저장한다. v1~v3 파일은 저장 형식이 달라지므로 원본을 보존하도록
+            // 빠른 저장 대상으로 삼지 않는다(Ctrl+S는 저장 대화상자를 열어 새 이름으로 현재 형식 저장을 유도).
             int version = ReadExperimentVersion(path);
             bool current = version == ExperimentSerializer.CurrentVersion;
             _experimentPath = current ? path : null;
             if (!current)
                 _simPanel.SetStatus(version == 1
                     ? $"v1 실험 파일을 불러왔습니다(개미 없음). 원본은 덮어쓰지 않으며, 저장하면 새 파일에 v{ExperimentSerializer.CurrentVersion} 형식으로 저장합니다. (틱 {loaded.Tick})"
-                    : $"v{version} 실험 파일을 불러왔습니다(감각 상태는 초기값). 원본은 덮어쓰지 않으며, 저장하면 새 파일에 v{ExperimentSerializer.CurrentVersion} 형식으로 저장합니다. (틱 {loaded.Tick})");
+                    : $"v{version} 실험 파일을 불러왔습니다({(version == 2 ? "감각 상태는 초기값, " : "")}냄새는 새 격자로 변환). 원본은 덮어쓰지 않으며, 저장하면 새 파일에 v{ExperimentSerializer.CurrentVersion} 형식으로 저장합니다. (틱 {loaded.Tick})");
         }
         catch (Exception e) when (e is MapFormatException or IOException or UnauthorizedAccessException)
         {

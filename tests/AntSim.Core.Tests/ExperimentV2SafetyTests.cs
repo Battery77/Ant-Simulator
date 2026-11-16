@@ -21,10 +21,10 @@ public class ExperimentV2SafetyTests(ITestOutputHelper output)
         new(SimulationSessionTests.SampleWorld(), ScentSettings.Default, Ants with { InitialCount = ants });
 
     /// <summary>
-    /// v2 레코드를 만든다. 저장은 v3이므로(단계 B1) 현재 저장 결과에서 단계 B 구간(체크섬 바로 앞)을 떼고 버전을 2로 바꿔
-    /// 체크섬을 다시 계산한다. 결과는 main(v2 저장)에서 같은 세션을 저장한 바이트와 같은 레이아웃이다.
+    /// v2 레코드를 만든다. 저장은 현재 형식(v4)이므로 현재 저장 결과를 같은 상태의 v2 바이트로 되돌린다(<see cref="ToLegacy"/>).
+    /// 결과는 main(v2 저장)에서 같은 세션을 저장한 바이트와 같은 레이아웃이다.
     /// </summary>
-    private static byte[] Save(SimulationSession session) => ToV2(SaveCurrent(session), session);
+    private static byte[] Save(SimulationSession session) => ToLegacy(SaveCurrent(session), session, 2);
 
     internal static byte[] SaveCurrent(SimulationSession session)
     {
@@ -33,18 +33,55 @@ public class ExperimentV2SafetyTests(ITestOutputHelper output)
         return stream.ToArray();
     }
 
-    /// <summary>v3 저장 바이트 → 같은 상태의 v2 바이트(단계 B 설정·개미별 단계 B 배열 제거).</summary>
-    internal static byte[] ToV2(byte[] v3, SimulationSession session)
+    /// <summary>현재 형식 레코드에서 냄새 구간이 시작하는 위치(헤더 28 + 냄새 설정 + 내장 월드 두 개 다음).</summary>
+    internal static int ScentSectionOffset(byte[] bytes)
     {
-        Assert.Equal(3, BinaryPrimitives.ReadUInt16LittleEndian(v3.AsSpan(8)));
-        int k = session.Sensing.TypeCount;
-        int block = 4 * 4 + 1 + 4 + session.Sensing.Keys.Sum(key => 4 + System.Text.Encoding.UTF8.GetByteCount(key))
+        int o = 28 + 8;
+        int types = BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(o));
+        o += 4;
+        for (int t = 0; t < types; t++)
+        {
+            for (int k = 0; k < 2; k++) o += 4 + BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(o));
+            o += 2 + 4 * 8;
+        }
+        for (int w = 0; w < 2; w++) o += 4 + BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(o));
+        return o;
+    }
+
+    /// <summary>
+    /// v4 저장 바이트 → 같은 상태의 v2 또는 v3 바이트. 냄새 구간을 원래 해상도(종류 × 레이어 × W·H)로 바꾸고(지상 묶음 칸 값은 그 묶음의 모든 칸에,
+    /// 개미집은 열린 칸에), v2면 단계 B 구간(체크섬 바로 앞)도 뗀다. 불러올 때의 변환(묶음 칸 평균, 열린 칸 선택)이 정확히 원래 값으로 돌아오도록
+    /// 지도 크기가 묶음 크기의 배수인 세션에 쓴다.
+    /// </summary>
+    internal static byte[] ToLegacy(byte[] v4, SimulationSession session, int version)
+    {
+        Assert.Equal(4, BinaryPrimitives.ReadUInt16LittleEndian(v4.AsSpan(8)));
+        Assert.True(version is 2 or 3);
+        var scent = session.Scent;
+        var config = session.World.Config;
+        Assert.True(config.Width % ScentGrid.SurfaceCellSize == 0 && config.Height % ScentGrid.SurfaceCellSize == 0);
+        int start = ScentSectionOffset(v4);
+        int nestCount = BinaryPrimitives.ReadInt32LittleEndian(v4.AsSpan(start + 4));
+        int scentEnd = start + 8 + scent.TypeCount * (scent.Grid(LayerId.Surface).Length + nestCount) * 4;
+
+        var legacy = new List<byte>();
+        for (int t = 0; t < scent.TypeCount; t++)
+        for (int l = 0; l < World.LayerCount; l++)
+        for (int y = 0; y < config.Height; y++)
+        for (int x = 0; x < config.Width; x++)
+            legacy.AddRange(BitConverter.GetBytes(scent.Get(t, (LayerId)l, x, y)));
+
+        int rest = v4.Length - 8;
+        if (version == 2)
+        {
+            int k = session.Sensing.TypeCount;
+            rest -= 4 * 4 + 1 + 4 + session.Sensing.Keys.Sum(key => 4 + System.Text.Encoding.UTF8.GetByteCount(key))
                     + session.Ants.Count * (ExperimentSerializer.StageBBytesPerAnt + 12 * k);
-        int end = v3.Length - 8;
-        var v2 = v3.AsSpan(0, end - block).ToArray().Concat(new byte[8]).ToArray();
-        BinaryPrimitives.WriteUInt16LittleEndian(v2.AsSpan(8), 2);
-        Rechecksum(v2);
-        return v2;
+        }
+        var result = v4.AsSpan(0, start).ToArray().Concat(legacy).Concat(v4.AsSpan(scentEnd, rest - scentEnd).ToArray()).Concat(new byte[8]).ToArray();
+        BinaryPrimitives.WriteUInt16LittleEndian(result.AsSpan(8), (ushort)version);
+        Rechecksum(result);
+        return result;
     }
 
     /// <summary>
@@ -110,11 +147,13 @@ public class ExperimentV2SafetyTests(ITestOutputHelper output)
         var loaded = Load(v1);
         Assert.Equal(0, loaded.Ants.Count);
         Assert.Equal(AntSettings.None, loaded.AntSettings);
-        Assert.Equal(3.5f, loaded.Scent.Field(0, LayerId.Surface)[17]);
+        // v1의 원래 해상도 지상 냄새는 묶음 칸 평균(합 / F²)으로 변환된다: 칸 (1,1)의 3.5 → 묶음 칸 (0,0) = 3.5 / 16.
+        Assert.Equal(3.5f / (ScentGrid.SurfaceCellSize * ScentGrid.SurfaceCellSize), loaded.Scent.Get(0, LayerId.Surface, 1, 1));
+        Assert.Equal(3.5, loaded.Scent.Total(0), 6); // 총량 보존
 
-        var v2 = SaveCurrent(loaded); // 저장은 현재 버전(v3)
+        var v2 = SaveCurrent(loaded); // 저장은 현재 버전(v4)
         Assert.Equal(ExperimentSerializer.CurrentVersion, BinaryPrimitives.ReadUInt16LittleEndian(v2.AsSpan(8)));
-        Assert.Equal(3, ExperimentSerializer.CurrentVersion);
+        Assert.Equal(4, ExperimentSerializer.CurrentVersion);
         Assert.Equal(StageAState(loaded), StageAState(Load(v2)));
 
         // 초기화해도 개미 0마리(v1 → 개미 없음 계약), 개미 설정 적용으로 다시 생성할 수 있다.

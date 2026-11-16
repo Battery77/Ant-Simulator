@@ -177,21 +177,28 @@ public sealed class AntSenseDetail
 /// <summary>
 /// 계산 스레드가 게시한 냄새 필드 복사본(한 레이어, 선택한 냄새 종류들). 사용 후 <see cref="SimulationHost.Release"/>로 반납한다.
 /// 시뮬레이션 데이터와 메모리를 공유하지 않으므로 렌더링이 실제 농도를 바꿀 수 없다.
-/// 배열은 풀에서 재사용되며 종류별로 처음 필요할 때 한 번만 만든다.
+/// 필드는 레이어의 표시 격자(<see cref="FieldWidth"/> × <see cref="FieldHeight"/>, 값 하나가 <see cref="CellSize"/>² 칸)다:
+/// 지상은 묶음 격자, 개미집은 원래 해상도(고체 칸 0). 배열은 풀에서 재사용되며 크기가 바뀔 때만 다시 만든다.
 /// </summary>
 public sealed class ScentSnapshot
 {
     private readonly float[]?[] _fields;
     private readonly float[] _maxes;
-    private readonly int _tileCount;
     private int[] _types = Array.Empty<int>();
 
-    internal ScentSnapshot(int typeCount, int tileCount)
+    internal ScentSnapshot(int typeCount)
     {
         _fields = new float[typeCount][];
         _maxes = new float[typeCount];
-        _tileCount = tileCount;
     }
+
+    /// <summary>필드 격자 크기와 값 하나가 덮는 칸의 한 변(지상 묶음 격자 F, 개미집 1).</summary>
+    public int FieldWidth { get; private set; }
+    public int FieldHeight { get; private set; }
+    public int CellSize { get; private set; } = 1;
+
+    /// <summary>칸 (x, y)가 속한 필드 인덱스.</summary>
+    public int FieldIndex(int x, int y) => (y / CellSize) * FieldWidth + x / CellSize;
 
     /// <summary>포함된 냄새 종류 인덱스(선택 순서).</summary>
     public IReadOnlyList<int> Types => _types;
@@ -232,13 +239,17 @@ public sealed class ScentSnapshot
     {
         if (_types.Length != types.Length) _types = new int[types.Length];
         types.CopyTo(_types);
+        var grid = scent.Grid(layer);
         foreach (int type in types)
         {
-            var field = scent.Field(type, layer);
-            var buffer = _fields[type] ??= new float[_tileCount];
-            field.CopyTo(buffer);
-            _maxes[type] = HeatmapRasterizer.ComputeMax(field);
+            var buffer = _fields[type];
+            if (buffer is null || buffer.Length != grid.DisplayLength) buffer = _fields[type] = new float[grid.DisplayLength];
+            scent.ExpandTo(type, layer, buffer);
+            _maxes[type] = HeatmapRasterizer.ComputeMax(scent.Field(type, layer));
         }
+        FieldWidth = grid.Width;
+        FieldHeight = grid.Height;
+        CellSize = grid.CellSize;
         Layer = layer;
     }
 }
@@ -648,7 +659,7 @@ public sealed class SimulationHost : IDisposable
             _freeSnapshots.TryPop(out snapshot);
         }
         int typeCount = _session.Scent.TypeCount;
-        snapshot ??= new ScentSnapshot(typeCount, _session.World.Config.TileCount);
+        snapshot ??= new ScentSnapshot(typeCount);
 
         Span<int> types = stackalloc int[requested.Length];
         int count = 0;

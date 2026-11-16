@@ -35,7 +35,7 @@ public sealed class SimulationSession
         _world = _initialWorld.Clone();
         _scentSystem = new ScentSystem(_world);
         Settings = settings;
-        Scent = new ScentState(_world.Config, settings.Types.Count);
+        Scent = new ScentState(_world, settings.Types.Count);
         LastSpawn = AntSpawner.SpawnInitial(Ants, _world, AntSettings);
     }
 
@@ -126,7 +126,7 @@ public sealed class SimulationSession
         Ants.Clear();
         Ants.ConfigureSensing(Sensing.TypeCount);
         LastSpawn = AntSpawner.SpawnInitial(Ants, _world, AntSettings);
-        Scent.Clear();
+        Scent.Rebuild(_world); // 시작 월드의 고체 칸으로 배치를 다시 만들고 0으로
         Tick = 0;
         ElapsedSeconds = 0;
         ResetCount++;
