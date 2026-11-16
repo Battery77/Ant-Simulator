@@ -55,10 +55,14 @@ public class AuditGoldenTests
         return hash.Value;
     }
 
+    /// <summary>
+    /// 냄새 저장 방식 변경(지상 4×4 묶음 격자 + 개미집 열린 칸, docs/PERF_SCENT_DESIGN.md, 사용자 결정 P-6)으로 다시 고정한 값.
+    /// 이전 값(cc5d416 ~ c968c01): 1813298136883749433.
+    /// </summary>
     [Fact]
     public void DefaultScentMath_IsUnchanged()
     {
-        Assert.Equal(1813298136883749433UL, ScentHashAfter50Ticks());
+        Assert.Equal(12683215632921426443UL, ScentHashAfter50Ticks());
     }
 
     [Theory]

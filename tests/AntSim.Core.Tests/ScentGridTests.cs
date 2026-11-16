@@ -170,7 +170,7 @@ public class ScentGridTests
         for (int t = 0; t < 500; t++) system.Tick(state, Single());
         Assert.Equal(0f, state.Get(0, LayerId.Surface, F, 0));
         Assert.Equal(0f, state.Get(0, LayerId.Surface, 2 * F, 0)); // 닫힌 묶음 칸 너머로 넘어가지 않는다
-        Assert.Equal(50f, state.Get(0, LayerId.Surface, 0, 0), 4);
+        Assert.Equal(50.0, state.Get(0, LayerId.Surface, 0, 0), 4);
 
         // 한 칸만 열면 그 묶음 칸이 열리고 냄새가 지나간다(지상의 얇은 벽은 냄새를 막지 못할 수 있다: 설계상 받아들인 대가).
         Assert.Equal(WorldError.None, world.Surface.TrySetState(F + 1, 1, new TileState(Terrain.Dirt, SolidBlock.None, 0, 0)));
