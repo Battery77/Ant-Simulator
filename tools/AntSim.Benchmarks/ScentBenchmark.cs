@@ -52,6 +52,7 @@ internal static class ScentBenchmark
             cases.Add(new Case($"세션 1틱 | 1024² | 2종 | 개미 {ants:N0}", () => Time(() => session.Step())));
         }
 
+        if (rounds == 0) cases.Clear(); // 메모리만 잰다
         var samples = cases.ToDictionary(c => c.Name, _ => new List<double>());
         for (int round = 0; round < rounds; round++)
             foreach (var c in cases)
@@ -71,16 +72,24 @@ internal static class ScentBenchmark
             Console.WriteLine($"| {parts[0]} | {parts[1]} | {parts[2]} | {parts[3]} | {s[s.Length / 2]:F3} | {s[0]:F3}~{s[^1]:F3} |");
         }
 
-        // 메모리(관리 힙 할당): 냄새 상태 + 계산 시스템 생성, 첫 틱 포함.
+        // 메모리: 냄새 상태 + 계산 시스템이 첫 틱 뒤 실제로 붙잡고 있는 관리 힙(전체 GC 후 차이). 임시 배열은 세지 않는다.
         foreach (int size in new[] { 1024, 2048 })
-        {
-            var world = BuildWorld(size, 0);
-            long before = GC.GetAllocatedBytesForCurrentThread();
-            var state = new ScentState(world.Config, 2);
-            var system = new ScentSystem(world);
-            system.Tick(state, Settings(2));
-            Console.WriteLine($"냄새 상태 + 시스템 + 첫 틱 할당 {size}², 2종: {(GC.GetAllocatedBytesForCurrentThread() - before) / 1e6:F1} MB");
-        }
+        foreach (int dug in new[] { 0, 100_000 })
+            Console.WriteLine($"냄새 상태 + 시스템 유지 메모리 {size}², 2종, 판 칸 통로 + {dug:N0}: {RetainedBytes(BuildWorld(size, dug)) / 1e6:F1} MB");
+    }
+
+    /// <summary>별도 메서드(인라인 금지): 이전 측정의 객체가 스택 슬롯에 남아 기준값을 흐리지 않도록.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static long RetainedBytes(World world)
+    {
+        long before = GC.GetTotalMemory(forceFullCollection: true);
+        var state = new ScentState(world.Config, 2);
+        var system = new ScentSystem(world);
+        system.Tick(state, Settings(2));
+        long retained = GC.GetTotalMemory(forceFullCollection: true) - before;
+        GC.KeepAlive(state);
+        GC.KeepAlive(system);
+        return retained;
     }
 
     private static ScentSettings Settings(int types) => new()
